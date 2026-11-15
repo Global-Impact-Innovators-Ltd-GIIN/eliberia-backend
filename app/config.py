@@ -7,8 +7,11 @@ load_dotenv()
 
 def _db_url():
     url = os.getenv("DATABASE_URL", "sqlite:///eliberia_dev.db")
-    if url.startswith("postgres://"):  # Render / Neon style URLs
-        url = url.replace("postgres://", "postgresql://", 1)
+    # Render / Neon give postgres:// or postgresql://; force the psycopg2 driver we install.
+    for prefix in ("postgres://", "postgresql://"):
+        if url.startswith(prefix):
+            url = "postgresql+psycopg2://" + url[len(prefix):]
+            break
     return url
 
 
