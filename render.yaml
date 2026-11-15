@@ -1,3 +1,7 @@
+databases:
+  - name: eliberia-db
+    plan: free   # Render free Postgres expires after 30 days; move to Neon/Supabase for longer use
+
 services:
   - type: web
     name: eliberia-backend
@@ -14,7 +18,9 @@ services:
       - key: DEBUG
         value: "False"
       - key: DATABASE_URL
-        sync: false   # paste the Neon/Supabase PostgreSQL URL
+        fromDatabase:
+          name: eliberia-db
+          property: connectionString
       - key: CORS_ORIGINS
         sync: false   # the Vercel frontend URL, e.g. https://eliberia.vercel.app
       - key: EXPOSE_OTP
