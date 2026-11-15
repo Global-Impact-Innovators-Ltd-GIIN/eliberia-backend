@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: eliberia-backend
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn dev_server:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.4
+      - key: SECRET_KEY
+        generateValue: true
+      - key: DEBUG
+        value: "False"
+      - key: DATABASE_URL
+        sync: false   # paste the Neon/Supabase PostgreSQL URL
+      - key: CORS_ORIGINS
+        sync: false   # the Vercel frontend URL, e.g. https://eliberia.vercel.app
+      - key: EXPOSE_OTP
+        value: "True" # demo only: no SMS gateway yet. Set False once SMS is wired.
