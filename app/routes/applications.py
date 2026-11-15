@@ -1,0 +1,262 @@
+import hashlib
+import os
+import uuid
+from datetime import timedelta
+
+from flask import Blueprint, current_app, g, jsonify, request, send_file
+
+from ..extensions import db
+from ..models import (Appointment, Application, ApplicationEvent, BiometricRecord, Document, Payment,
+                      Service, now)
+from ..services import biometrics, payments
+from ..utils import audit, auth_required, err, gen_reference, notify
+from .catalog import CENTERS
+
+bp = Blueprint("applications", __name__, url_prefix="/api/applications")
+
+ALLOWED_EXT = {".pdf", ".png", ".jpg", ".jpeg"}
+
+
+def _log(app_, status, message, actor=None):
+    app_.status = status
+    db.session.add(ApplicationEvent(application=app_, status=status, message=message,
+                                    actor=actor or g.user.full_name))
+
+
+def _own(app_id):
+    a = db.session.get(Application, app_id)
+    if not a or (a.user_id != g.user.id and g.user.role == "citizen"):
+        return None
+    return a
+
+
+def _validate(service, data):
+    missing = [f["label"] for f in (service.form_fields or [])
+               if f.get("required") and not str(data.get(f["name"], "")).strip()]
+    return missing
+
+
+@bp.post("")
+@auth_required("citizen")
+def create():
+    d = request.get_json(silent=True) or {}
+    s = Service.query.filter_by(code=d.get("service_code"), active=True).first()
+    if not s:
+        return err("Service not found", 404)
+    a = Application(reference=gen_reference(), user_id=g.user.id, service=s,
+                    data=d.get("data") or {}, fee_usd=s.fee_usd)
+    db.session.add(a)
+    _log(a, "draft", "Application started")
+    audit("application_create", a.reference)
+    db.session.commit()
+    return jsonify(a.to_dict(full=True)), 201
+
+
+@bp.get("")
+@auth_required("citizen")
+def mine():
+    items = Application.query.filter_by(user_id=g.user.id).order_by(Application.id.desc()).all()
+    return jsonify([a.to_dict() for a in items])
+
+
+@bp.get("/track/<reference>")
+def track(reference):
+    """Public status tracking by reference (no personal data returned)."""
+    a = Application.query.filter_by(reference=reference.upper()).first()
+    if not a:
+        return err("No application found with that reference", 404)
+    return jsonify({"reference": a.reference, "service": a.service.name, "status": a.status,
+                    "updated_at": a.updated_at.isoformat(),
+                    "events": [{"status": e.status, "message": e.message, "created_at": e.created_at.isoformat()}
+                               for e in a.events]})
+
+
+@bp.get("/<int:app_id>")
+@auth_required()
+def detail(app_id):
+    a = _own(app_id)
+    if not a:
+        return err("Application not found", 404)
+    return jsonify(a.to_dict(full=True))
+
+
+@bp.put("/<int:app_id>")
+@auth_required("citizen")
+def update(app_id):
+    a = _own(app_id)
+    if not a:
+        return err("Application not found", 404)
+    if a.status not in ("draft", "info_requested"):
+        return err("This application can no longer be edited", 409)
+    a.data = (request.get_json(silent=True) or {}).get("data", a.data)
+    db.session.commit()
+    return jsonify(a.to_dict(full=True))
+
+
+@bp.post("/<int:app_id>/documents")
+@auth_required("citizen")
+def upload_document(app_id):
+    a = _own(app_id)
+    if not a:
+        return err("Application not found", 404)
+    f = request.files.get("file")
+    if not f or not f.filename:
+        return err("No file uploaded")
+    ext = os.path.splitext(f.filename)[1].lower()
+    if ext not in ALLOWED_EXT:
+        return err("Only PDF, PNG and JPG files are allowed")
+    raw = f.read()
+    stored = uuid.uuid4().hex + ext
+    os.makedirs(current_app.config["UPLOAD_DIR"], exist_ok=True)
+    with open(os.path.join(current_app.config["UPLOAD_DIR"], stored), "wb") as out:
+        out.write(raw)
+    doc = Document(application=a, doc_type=request.form.get("doc_type", "other"),
+                   filename=os.path.basename(f.filename)[:200], stored_name=stored,
+                   sha256=hashlib.sha256(raw).hexdigest())
+    db.session.add(doc)
+    db.session.commit()
+    return jsonify(doc.to_dict()), 201
+
+
+@bp.get("/<int:app_id>/documents/<int:doc_id>")
+@auth_required()
+def download_document(app_id, doc_id):
+    a = _own(app_id)
+    doc = db.session.get(Document, doc_id)
+    if g.user.role == "officer" and not a:
+        a = db.session.get(Application, app_id)
+    if not a or not doc or doc.application_id != a.id:
+        return err("Document not found", 404)
+    return send_file(os.path.join(current_app.config["UPLOAD_DIR"], doc.stored_name),
+                     download_name=doc.filename)
+
+
+@bp.post("/<int:app_id>/submit")
+@auth_required("citizen")
+def submit(app_id):
+    a = _own(app_id)
+    if not a:
+        return err("Application not found", 404)
+    if a.status not in ("draft", "info_requested"):
+        return err("Application already submitted", 409)
+    missing = _validate(a.service, a.data or {})
+    if missing:
+        return err("Missing required fields: " + ", ".join(missing))
+    required_docs = a.service.required_documents or []
+    if required_docs and len(a.documents) < len(required_docs):
+        return err(f"Please upload all {len(required_docs)} required documents")
+    if a.fee_usd > 0 and not a.paid:
+        return err("Payment is required before submitting", 402)
+    a.due_at = now() + timedelta(days=a.service.sla_days)
+    _log(a, "submitted", "Application submitted")
+    notify(a.user_id, "Application submitted", f"{a.reference} was received by {a.service.institution.name}.")
+    audit("application_submit", a.reference)
+    db.session.commit()
+    return jsonify(a.to_dict(full=True))
+
+
+# ---- payments ----
+@bp.post("/<int:app_id>/pay")
+@auth_required("citizen")
+def pay(app_id):
+    a = _own(app_id)
+    if not a:
+        return err("Application not found", 404)
+    d = request.get_json(silent=True) or {}
+    if d.get("method") not in payments.METHODS:
+        return err("Unsupported payment method")
+    if a.paid or a.fee_usd <= 0:
+        return err("Nothing to pay", 409)
+    p = payments.initiate(a, d["method"], d.get("msisdn") or g.user.phone)
+    audit("payment_initiate", p.txn_ref)
+    db.session.commit()
+    return jsonify({**p.to_dict(), "message": "Approve the payment prompt on your phone."}), 201
+
+
+@bp.post("/payments/<txn_ref>/confirm")
+@auth_required("citizen")
+def confirm_payment(txn_ref):
+    """Mock provider callback. In production this is the provider's signed webhook, not a user call."""
+    if current_app.config["PAYMENT_PROVIDER"] != "mock":
+        return err("Not available", 404)
+    p = Payment.query.filter_by(txn_ref=txn_ref).first()
+    if not p or p.application.user_id != g.user.id:
+        return err("Payment not found", 404)
+    if p.status != "pending":
+        return err("Payment already processed", 409)
+    payments.settle(p, success=(request.get_json(silent=True) or {}).get("success", True))
+    if p.status == "success":
+        notify(g.user.id, "Payment received", f"${p.amount_usd:.2f} for {p.application.reference}")
+    audit("payment_" + p.status, p.txn_ref)
+    db.session.commit()
+    return jsonify(p.to_dict())
+
+
+# ---- biometrics ----
+@bp.post("/<int:app_id>/biometrics")
+@auth_required("citizen")
+def capture_biometric(app_id):
+    a = _own(app_id)
+    if not a:
+        return err("Application not found", 404)
+    if a.status != "biometric_pending":
+        return err("Biometrics are not requested for this application right now", 409)
+    kind = request.form.get("kind", "face")
+    if kind == "fingerprint":
+        return err("Fingerprint capture needs a certified scanner: please book a service center appointment", 422)
+    f = request.files.get("image")
+    if kind != "face" or not f:
+        return err("A face image is required")
+    raw = f.read()
+    if len(raw) < 1000:
+        return err("Image is too small or unreadable")
+    liveness, match = biometrics.verify(kind, raw, request.form.get("liveness", 0))
+    name, digest = biometrics.save_image(raw, f"bio{a.id}")
+    ok = biometrics.is_verified(kind, liveness, match)
+    rec = BiometricRecord(user_id=g.user.id, application_id=a.id, kind=kind, source="remote",
+                                     stored_name=name, sha256=digest, liveness_score=liveness,
+                                     match_score=match, status="verified" if ok else "failed")
+    db.session.add(rec)
+    if ok:
+        biometrics.dispatch(rec, a.service.institution)
+        _log(a, "in_review", "Remote face verification passed and sent to the institution", "System")
+        notify(a.user_id, "Biometrics verified", f"{a.reference} is back with the officer for a decision.")
+    audit("biometric_" + rec.status, a.reference)
+    db.session.commit()
+    return jsonify({"record": rec.to_dict(), "passed": ok,
+                    "message": "Verified" if ok else "Verification failed. Retry in good light, facing the camera."}), 201 if ok else 422
+
+
+# ---- appointments ----
+@bp.post("/<int:app_id>/appointments")
+@auth_required("citizen")
+def book(app_id):
+    a = _own(app_id)
+    if not a:
+        return err("Application not found", 404)
+    d = request.get_json(silent=True) or {}
+    if d.get("center") not in CENTERS:
+        return err("Unknown service center")
+    try:
+        from datetime import datetime
+        slot = datetime.fromisoformat(d["slot"]).replace(tzinfo=None)
+    except Exception:
+        return err("A valid ISO date/time 'slot' is required")
+    if slot <= now():
+        return err("Choose a future time slot")
+    if Appointment.query.filter_by(center=d["center"], slot=slot, status="booked").count() >= 5:
+        return err("That slot is full. Please choose another.", 409)
+    purpose = d.get("purpose", "biometrics")
+    ap = Appointment(application_id=a.id, user_id=g.user.id, center=d["center"], slot=slot, purpose=purpose)
+    db.session.add(ap)
+    notify(g.user.id, "Appointment booked", f"{d['center']} on {slot:%d %b %Y %H:%M}")
+    audit("appointment_book", a.reference)
+    db.session.commit()
+    return jsonify(ap.to_dict()), 201
+
+
+@bp.get("/appointments/mine")
+@auth_required("citizen")
+def my_appointments():
+    items = Appointment.query.filter_by(user_id=g.user.id).order_by(Appointment.slot).all()
+    return jsonify([x.to_dict() for x in items])
