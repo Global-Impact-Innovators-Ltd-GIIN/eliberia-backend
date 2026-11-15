@@ -6,10 +6,10 @@ from datetime import timedelta
 from flask import Blueprint, current_app, g, jsonify, request, send_file
 
 from ..extensions import db
-from ..models import (Appointment, Application, ApplicationEvent, BiometricRecord, Document, Payment,
-                      Service, now)
+from ..models import (Appointment, Application, ApplicationEvent, BiometricRecord, Document, Feedback,
+                      Payment, Service, now)
 from ..services import biometrics, payments
-from ..utils import audit, auth_required, err, gen_reference, notify
+from ..utils import audit, auth_required, err, gen_bill_id, gen_reference, notify, rate_limit
 from .catalog import CENTERS
 
 bp = Blueprint("applications", __name__, url_prefix="/api/applications")
@@ -43,8 +43,15 @@ def create():
     s = Service.query.filter_by(code=d.get("service_code"), active=True).first()
     if not s:
         return err("Service not found", 404)
+    ben = d.get("beneficiary") or None
+    if ben:
+        name = str(ben.get("name") or "").strip()[:150]
+        if len(name) < 3:
+            return err("Enter the full name of the person you are applying for")
+        ben = {"name": name, "relation": str(ben.get("relation") or "Other")[:40]}
     a = Application(reference=gen_reference(), user_id=g.user.id, service=s,
-                    data=d.get("data") or {}, fee_usd=s.fee_usd)
+                    data=d.get("data") or {}, fee_usd=s.fee_usd, beneficiary=ben,
+                    bill_id=gen_bill_id() if s.fee_usd > 0 else None)
     db.session.add(a)
     _log(a, "draft", "Application started")
     audit("application_create", a.reference)
@@ -60,12 +67,17 @@ def mine():
 
 
 @bp.get("/track/<reference>")
+@rate_limit("track", 60, 600)
 def track(reference):
-    """Public status tracking by reference (no personal data returned)."""
-    a = Application.query.filter_by(reference=reference.upper()).first()
+    """Public status tracking by reference or bill ID (no personal data returned)."""
+    key = reference.strip().upper()
+    a = (Application.query.filter_by(reference=key).first()
+         or Application.query.filter_by(bill_id=key).first())
     if not a:
-        return err("No application found with that reference", 404)
+        return err("No application found with that reference or bill ID", 404)
     return jsonify({"reference": a.reference, "service": a.service.name, "status": a.status,
+                    "institution": a.service.institution.name, "paid": a.paid, "fee_usd": a.fee_usd,
+                    "due_at": a.due_at.isoformat() if a.due_at else None,
                     "updated_at": a.updated_at.isoformat(),
                     "events": [{"status": e.status, "message": e.message, "created_at": e.created_at.isoformat()}
                                for e in a.events]})
@@ -260,3 +272,26 @@ def book(app_id):
 def my_appointments():
     items = Appointment.query.filter_by(user_id=g.user.id).order_by(Appointment.slot).all()
     return jsonify([x.to_dict() for x in items])
+
+
+# ---- feedback ----
+@bp.post("/<int:app_id>/feedback")
+@auth_required("citizen")
+def feedback(app_id):
+    a = _own(app_id)
+    if not a:
+        return err("Application not found", 404)
+    if a.status not in ("approved", "ready_for_collection", "completed", "rejected"):
+        return err("You can rate the service once a decision has been made", 409)
+    d = request.get_json(silent=True) or {}
+    try:
+        rating = int(d.get("rating"))
+    except (TypeError, ValueError):
+        rating = 0
+    if not 1 <= rating <= 5:
+        return err("Rating must be between 1 and 5")
+    fb = Feedback.query.filter_by(application_id=a.id).first() or Feedback(application_id=a.id)
+    fb.rating, fb.comment = rating, (d.get("comment") or "")[:500]
+    db.session.add(fb)
+    db.session.commit()
+    return jsonify(fb.to_dict()), 201

@@ -4,7 +4,7 @@ from sqlalchemy import func
 from ..extensions import db
 from ..models import (Appointment, Application, ApplicationEvent, AuditLog, BiometricRecord,
                       Notification, Service, User, now)
-from ..services import biometrics
+from ..services import biometrics, certificates
 from ..utils import audit, auth_required, err, notify
 
 bp = Blueprint("staff", __name__, url_prefix="/api")
@@ -26,7 +26,7 @@ def _get(app_id):
 @bp.get("/notifications")
 @auth_required()
 def notifications():
-    items = Notification.query.filter_by(user_id=g.user.id).order_by(Notification.id.desc()).limit(50).all()
+    items = Notification.query.filter_by(user_id=g.user.id, channel="app").order_by(Notification.id.desc()).limit(50).all()
     return jsonify([n.to_dict() for n in items])
 
 
@@ -81,7 +81,8 @@ def action(app_id):
         if svc.requires_face and not any(b.status == "dispatched" and b.kind == "face" for b in
                                         BiometricRecord.query.filter_by(application_id=a.id)):
             return err("Face verification is required before approval. Request biometrics first.", 409)
-        status, msg = "approved", note or "Application approved"
+        cert = certificates.issue(a)
+        status, msg = "approved", (note or "Application approved") + f". Certificate {cert.number} issued."
     elif act == "reject" and a.status in ("in_review", "submitted"):
         if not note:
             return err("A reason is required to reject")

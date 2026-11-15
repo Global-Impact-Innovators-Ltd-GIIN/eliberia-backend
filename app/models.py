@@ -49,6 +49,11 @@ class User(db.Model):
     otp_expires = db.Column(db.DateTime)
     language = db.Column(db.String(10), default="en")
     created_at = db.Column(db.DateTime, default=now)
+    # account security
+    failed_logins = db.Column(db.Integer, default=0)
+    locked_until = db.Column(db.DateTime)
+    otp_attempts = db.Column(db.Integer, default=0)
+    token_version = db.Column(db.Integer, default=0)
 
     def to_dict(self):
         return {
@@ -105,6 +110,8 @@ class Application(db.Model):
     created_at = db.Column(db.DateTime, default=now)
     updated_at = db.Column(db.DateTime, default=now, onupdate=now)
     due_at = db.Column(db.DateTime)
+    bill_id = db.Column(db.String(20))  # pay-anywhere bill number (mobile money, bank, agent)
+    beneficiary = db.Column(JSONText)  # {"name","relation"} when applying on behalf of someone
     user = db.relationship("User", foreign_keys=[user_id])
     service = db.relationship("Service")
     events = db.relationship("ApplicationEvent", backref="application",
@@ -116,7 +123,8 @@ class Application(db.Model):
             "id": self.id, "reference": self.reference, "status": self.status,
             "service": {"id": self.service.id, "code": self.service.code, "name": self.service.name,
                         "institution": self.service.institution.name},
-            "fee_usd": self.fee_usd, "paid": self.paid,
+            "fee_usd": self.fee_usd, "paid": self.paid, "bill_id": self.bill_id,
+            "beneficiary": self.beneficiary,
             "created_at": self.created_at.isoformat(), "updated_at": self.updated_at.isoformat(),
             "due_at": self.due_at.isoformat() if self.due_at else None,
             "applicant": {"id": self.user.id, "full_name": self.user.full_name, "phone": self.user.phone},
@@ -129,6 +137,10 @@ class Application(db.Model):
             d["biometrics"] = [b.to_dict() for b in BiometricRecord.query.filter_by(application_id=self.id)]
             d["payments"] = [p.to_dict() for p in Payment.query.filter_by(application_id=self.id)]
             d["service_detail"] = self.service.to_dict()
+            cert = Certificate.query.filter_by(application_id=self.id).first()
+            d["certificate"] = cert.to_dict() if cert else None
+            fb = Feedback.query.filter_by(application_id=self.id).first()
+            d["feedback"] = fb.to_dict() if fb else None
         return d
 
 
@@ -238,3 +250,32 @@ class AuditLog(db.Model):
     def to_dict(self):
         return {"id": self.id, "user_id": self.user_id, "action": self.action, "detail": self.detail,
                 "ip": self.ip, "created_at": self.created_at.isoformat()}
+
+
+class Certificate(db.Model):
+    """Digitally signed e-certificate issued on approval; anyone can verify it by number / QR code."""
+    id = db.Column(db.Integer, primary_key=True)
+    number = db.Column(db.String(30), unique=True, nullable=False)
+    application_id = db.Column(db.Integer, db.ForeignKey("application.id"), unique=True, nullable=False)
+    holder_name = db.Column(db.String(150), nullable=False)
+    service_name = db.Column(db.String(200), nullable=False)
+    institution_name = db.Column(db.String(200), nullable=False)
+    issued_at = db.Column(db.DateTime, default=now)
+    signature = db.Column(db.String(64), nullable=False)
+    revoked = db.Column(db.Boolean, default=False)
+
+    def to_dict(self):
+        return {"number": self.number, "holder_name": self.holder_name, "service_name": self.service_name,
+                "institution_name": self.institution_name, "issued_at": self.issued_at.isoformat(),
+                "revoked": self.revoked}
+
+
+class Feedback(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    application_id = db.Column(db.Integer, db.ForeignKey("application.id"), unique=True, nullable=False)
+    rating = db.Column(db.Integer, nullable=False)  # 1-5
+    comment = db.Column(db.String(500))
+    created_at = db.Column(db.DateTime, default=now)
+
+    def to_dict(self):
+        return {"rating": self.rating, "comment": self.comment, "created_at": self.created_at.isoformat()}
