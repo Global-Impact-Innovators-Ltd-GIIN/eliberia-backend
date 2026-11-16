@@ -26,6 +26,6 @@ services:
       - key: EXPOSE_OTP
         value: "True" # demo only: no SMS gateway yet. Set False here once SMS is wired.
       - key: DEMO_MODE
-        value: "True" # public demo accounts. Set False here after creating your own admin (see README).
+        value: "False" # public demo accounts are disabled; the platform's own super admin is in place.
       - key: TASKS_SECRET
         generateValue: true # copy it into the backend repository's GitHub secrets for the daily job
