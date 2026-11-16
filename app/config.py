@@ -17,6 +17,8 @@ def _db_url():
 
 class Config:
     SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-change-me")
+    # key for encrypting personal data at rest; falls back to SECRET_KEY. Never change it once data exists.
+    DATA_KEY = os.getenv("DATA_KEY") or None
     SQLALCHEMY_DATABASE_URI = _db_url()
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")]

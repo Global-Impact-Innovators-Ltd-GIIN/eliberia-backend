@@ -181,6 +181,36 @@ SERVICES += [
 ]
 
 
+def _upgrade_v2(s):
+    """Seeded services gain document rules and identity-document questions (never touches edited ones)."""
+    from .rules import normalize_doc_rules
+    foreigner = s.code in ("RESIDENT_PERMIT", "WORK_PERMIT")
+    fields, has_identity = [], False
+    for f in s.form_fields or []:
+        name = f.get("name")
+        if f.get("type") == "identity":
+            has_identity = True
+        elif name == "nin":
+            f = {"name": "nin", "label": "National ID number", "type": "identity", "required": f.get("required", True),
+                 "doc_types": ["National ID"], "countries": ["LR"]}
+        elif name == "passport_no":
+            f = {"name": "passport_no", "label": "Passport", "type": "identity", "required": True,
+                 "doc_types": ["Passport"]}
+            if not foreigner:
+                f["countries"] = ["LR"]
+                f["label"] = "Current Liberian passport number"
+            has_identity = True
+        elif name == "nationality" and foreigner:
+            if any(x.get("name") == "passport_no" for x in s.form_fields):
+                continue  # the passport question now asks for nationality itself
+            f = {"name": "passport_no", "label": "Passport", "type": "identity", "required": True,
+                 "doc_types": ["Passport"]}
+        fields.append(f)
+    s.form_fields = fields
+    s.required_documents = normalize_doc_rules(s.required_documents)
+    s.seed_version = 2
+
+
 def seed(reset_demo=True):
     insts = {}
     for code, name, desc in INSTITUTIONS:
@@ -196,6 +226,10 @@ def seed(reset_demo=True):
         s.requires_face, s.requires_fingerprint, s.required_documents = face, finger, docs
         s.form_fields, s.description = fields, desc
         db.session.add(s)
+    db.session.flush()
+    for s in Service.query:
+        if (s.seed_version or 0) < 2:
+            _upgrade_v2(s)
     if reset_demo and not User.query.filter_by(role="admin").first():
         db.session.add(User(full_name="System Admin", phone="+231770000001", role="admin",
                             password_hash=generate_password_hash("Admin@12345"), phone_verified=True))
@@ -208,4 +242,9 @@ def seed(reset_demo=True):
         # demo mode only: a sample agent so the agent desk can be tried
         db.session.add(User(full_name="Demo Agent (Paynesville)", phone="+231770000004", role="agent",
                             password_hash=generate_password_hash("Agent@12345"), phone_verified=True))
+    if current_app.config.get("EXPOSE_OTP") and not User.query.filter_by(role="inst_admin").first():
+        # demo mode only: an institution administrator for the National Identification Registry
+        db.session.add(User(full_name="NIR Administrator", phone="+231770000005", role="inst_admin",
+                            institution_id=insts["NIR"].id,
+                            password_hash=generate_password_hash("InstAdmin@12345"), phone_verified=True))
     db.session.commit()

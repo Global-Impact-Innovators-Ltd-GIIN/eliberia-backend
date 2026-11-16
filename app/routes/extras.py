@@ -9,7 +9,9 @@ from ..extensions import db
 from ..models import (Application, ApplicationEvent, Certificate, Institution, Message, Notification,
                       Service, User)
 from ..services import certificates
-from ..utils import audit, auth_required, err, normalize_phone, notify, rate_limit
+from ..rules import normalize_doc_rules
+from ..services import forms, identity
+from ..utils import audit, auth_required, err, need, normalize_phone, notify, rate_limit
 from .applications import _own
 
 bp = Blueprint("extras", __name__, url_prefix="/api")
@@ -67,7 +69,7 @@ def my_certificates():
 
 
 @bp.post("/staff/certificates/<number>/revoke")
-@auth_required("officer", "admin")
+@auth_required("officer", "inst_admin", "admin")
 def revoke_certificate(number):
     cert = Certificate.query.filter_by(number=number.strip().upper()).first()
     a = _own(cert.application_id) if cert else None
@@ -88,20 +90,20 @@ def revoke_certificate(number):
 
 
 # ---------------- admin: manage the service catalog ----------------
-FIELD_TYPES = {"text", "date", "number", "select"}
+FIELD_TYPES = set(forms.FIELD_TYPES)
 
 
 def _slug(label):
     return re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_")[:40] or "field"
 
 
-def _apply_service(s, d, creating):
+def _apply_service(s, d, creating, lock_institution=None):
     """Validate and copy editable properties onto a Service. Returns an error message or None."""
     name = (d.get("name", s.name) or "").strip()
     category = (d.get("category", s.category) or "").strip()
     if len(name) < 3 or len(category) < 2:
         return "Name and category are required"
-    inst = db.session.get(Institution, d.get("institution_id", s.institution_id) or 0)
+    inst = db.session.get(Institution, lock_institution or d.get("institution_id", s.institution_id) or 0)
     if not inst:
         return "Choose a valid institution"
     try:
@@ -113,7 +115,21 @@ def _apply_service(s, d, creating):
         return "Fee must be 0-10000 and processing time 1-365 days"
     docs = d.get("required_documents", s.required_documents or [])
     if not isinstance(docs, list) or len(docs) > 10:
-        return "required_documents must be a list of up to 10 names"
+        return "required_documents must be a list of up to 10 documents"
+    for it in docs:
+        if isinstance(it, dict):
+            if not str(it.get("name") or "").strip():
+                return "Every required document needs a name"
+            if not [x for x in (it.get("formats") or []) if x in ("pdf", "jpg", "png")]:
+                return f"Choose at least one accepted format for '{it['name']}'"
+            try:
+                if not 0.1 <= float(it.get("max_mb", 5)) <= 8:
+                    raise ValueError
+            except (TypeError, ValueError):
+                return f"The size limit for '{it['name']}' must be between 0.1 and 8 MB"
+    doc_rules = normalize_doc_rules(docs)
+    if len({r["name"] for r in doc_rules}) != len(doc_rules):
+        return "Two required documents share the same name"
     fields_in = d.get("form_fields", s.form_fields or [])
     if not isinstance(fields_in, list) or len(fields_in) > 25:
         return "form_fields must be a list of up to 25 fields"
@@ -122,7 +138,7 @@ def _apply_service(s, d, creating):
         label = str(f.get("label") or "").strip()[:80]
         ftype = f.get("type", "text")
         if not label or ftype not in FIELD_TYPES:
-            return "Every form field needs a label and a type of text, date, number or select"
+            return "Every question needs a label and a valid answer type"
         fname = f.get("name") or _slug(label)
         if fname in seen:
             return f"Two fields share the name '{fname}'"
@@ -133,12 +149,29 @@ def _apply_service(s, d, creating):
             if len(opts) < 2:
                 return f"'{label}' needs at least two options"
             item["options"] = opts
+        if ftype == "identity":
+            docs_ok = [x for x in (f.get("doc_types") or []) if x in identity.DOC_TYPES]
+            countries_ok = [c for c in (f.get("countries") or []) if c in identity.COUNTRIES]
+            if docs_ok and len(docs_ok) < len(identity.DOC_TYPES):
+                item["doc_types"] = docs_ok
+            if countries_ok:
+                item["countries"] = countries_ok[:20]
+            if item.get("doc_types") == [identity.NATIONAL_ID] and countries_ok and countries_ok != [identity.HOME]:
+                return f"'{label}': a National ID can only be asked of Liberian nationals"
+        if str(f.get("help") or "").strip():
+            item["help"] = str(f["help"]).strip()[:200]
+        if f.get("max_length"):
+            try:
+                item["max_length"] = max(1, min(int(f["max_length"]), 300))
+            except (TypeError, ValueError):
+                return f"'{label}': maximum length must be a number"
         fields.append(item)
     s.name, s.category, s.institution_id, s.fee_usd, s.sla_days = name[:200], category[:60], inst.id, fee, sla
     s.description = str(d.get("description", s.description or ""))[:1000]
     s.requires_face = bool(d.get("requires_face", s.requires_face))
     s.requires_fingerprint = bool(d.get("requires_fingerprint", s.requires_fingerprint))
-    s.required_documents = [str(x).strip()[:80] for x in docs if str(x).strip()]
+    s.required_documents = doc_rules
+    s.seed_version = 99  # hand-edited: seed upgrades must never overwrite it
     s.form_fields = fields
     s.active = bool(d.get("active", True if creating else s.active))
     return None
@@ -151,12 +184,15 @@ def _admin_dict(s):
 @bp.get("/admin/services")
 @auth_required("admin")
 def admin_services():
-    return jsonify([_admin_dict(s) for s in Service.query.order_by(Service.category, Service.name)])
+    return need("services") or jsonify([_admin_dict(s) for s in Service.query.order_by(Service.category, Service.name)])
 
 
 @bp.post("/admin/services")
 @auth_required("admin")
 def admin_create_service():
+    gate = need("services")
+    if gate:
+        return gate
     d = request.get_json(silent=True) or {}
     code = re.sub(r"[^A-Z0-9_]", "", str(d.get("code") or "").upper().replace(" ", "_"))[:40]
     if len(code) < 3:
@@ -176,6 +212,9 @@ def admin_create_service():
 @bp.put("/admin/services/<code>")
 @auth_required("admin")
 def admin_update_service(code):
+    gate = need("services")
+    if gate:
+        return gate
     s = Service.query.filter_by(code=code).first()
     if not s:
         return err("Service not found", 404)

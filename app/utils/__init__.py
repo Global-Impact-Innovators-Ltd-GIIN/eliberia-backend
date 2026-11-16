@@ -9,7 +9,7 @@ import jwt
 from flask import current_app, g, jsonify, request
 
 from ..extensions import db
-from ..models import AuditLog, Notification, User
+from ..models import AccessLog, AuditLog, Notification, User
 
 
 def err(message, code=400):
@@ -117,3 +117,36 @@ def gen_reference(prefix="LR"):
 
 def gen_bill_id():
     return "88" + "".join(str(secrets.randbelow(10)) for _ in range(10))
+
+
+# areas a platform administrator can be limited to; None / ["all"] means super administrator
+ADMIN_PERMS = ("services", "team", "institutions", "audit", "support", "finance")
+
+
+def has_perm(user, perm):
+    if user.role != "admin":
+        return False
+    perms = user.admin_perms
+    return not perms or "all" in perms or perm in perms
+
+
+def need(perm):
+    """Error response when the signed-in admin lacks a permission, else None."""
+    if has_perm(g.user, perm):
+        return None
+    return err(f"Your admin account does not have the '{perm}' permission", 403)
+
+
+def record_access(application, what):
+    """Note that a member of staff looked at a citizen's application (at most once per half hour per action)."""
+    from datetime import timedelta as _td
+    from ..models import Institution, now
+    u = g.user
+    recent = AccessLog.query.filter(AccessLog.application_id == application.id, AccessLog.viewer_id == u.id,
+                                    AccessLog.what == what, AccessLog.created_at > now() - _td(minutes=30)).first()
+    if recent:
+        return
+    inst = db.session.get(Institution, u.institution_id) if u.institution_id else None
+    db.session.add(AccessLog(application_id=application.id, viewer_id=u.id, viewer_name=u.full_name,
+                             viewer_role=u.role, organisation=inst.name if inst else "eLiberia platform team",
+                             what=what[:120]))

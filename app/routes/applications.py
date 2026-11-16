@@ -8,8 +8,9 @@ from flask import Blueprint, current_app, g, jsonify, request, send_file
 from ..extensions import db
 from ..models import (Appointment, Application, ApplicationEvent, BiometricRecord, Document, Feedback,
                       Payment, Service, now)
-from ..services import biometrics, payments
-from ..utils import audit, auth_required, err, gen_bill_id, gen_reference, notify, rate_limit
+from ..rules import check_file, normalize_doc_rules
+from ..services import biometrics, forms, payments, vault
+from ..utils import audit, auth_required, err, gen_bill_id, gen_reference, notify, rate_limit, record_access
 from .catalog import CENTERS
 
 bp = Blueprint("applications", __name__, url_prefix="/api/applications")
@@ -32,7 +33,7 @@ def _own(app_id):
     u = g.user
     allowed = ((u.role == "citizen" and a.user_id == u.id)
                or (u.role == "agent" and a.agent_id == u.id)
-               or (u.role == "officer" and a.service.institution_id == u.institution_id)
+               or (u.role in ("officer", "inst_admin") and a.service.institution_id == u.institution_id)
                or u.role == "admin")
     return a if allowed else None
 
@@ -131,15 +132,33 @@ def upload_document(app_id):
     f = request.files.get("file")
     if not f or not f.filename:
         return err("No file uploaded")
+    if a.status not in ("draft", "info_requested"):
+        return err("Documents can only be changed before the application is submitted", 409)
     ext = os.path.splitext(f.filename)[1].lower()
-    if ext not in ALLOWED_EXT:
-        return err("Only PDF, PNG and JPG files are allowed")
+    doc_type = (request.form.get("doc_type") or "").strip()
+    rules = normalize_doc_rules(a.service.required_documents)
+    if rules:
+        rule = next((r for r in rules if r["name"] == doc_type), None)
+        if not rule:
+            return err("Choose which required document this file is")
+    else:
+        rule = normalize_doc_rules([doc_type or "Supporting document"])[0]
+        doc_type = rule["name"]
     raw = f.read()
+    problem = check_file(rule, f.filename, raw)  # the institution's format and size rules
+    if problem:
+        return err(problem)
+    for old in [x for x in a.documents if x.doc_type == doc_type]:  # a new upload replaces the old one
+        try:
+            os.remove(os.path.join(current_app.config["UPLOAD_DIR"], old.stored_name))
+        except OSError:
+            pass
+        db.session.delete(old)
     stored = uuid.uuid4().hex + ext
     os.makedirs(current_app.config["UPLOAD_DIR"], exist_ok=True)
     with open(os.path.join(current_app.config["UPLOAD_DIR"], stored), "wb") as out:
-        out.write(raw)
-    doc = Document(application=a, doc_type=request.form.get("doc_type", "other"),
+        out.write(vault.encrypt_bytes(raw))  # encrypted at rest
+    doc = Document(application=a, doc_type=doc_type,
                    filename=os.path.basename(f.filename)[:200], stored_name=stored,
                    sha256=hashlib.sha256(raw).hexdigest())
     db.session.add(doc)
@@ -152,12 +171,18 @@ def upload_document(app_id):
 def download_document(app_id, doc_id):
     a = _own(app_id)
     doc = db.session.get(Document, doc_id)
-    if g.user.role == "officer" and not a:
-        a = db.session.get(Application, app_id)
     if not a or not doc or doc.application_id != a.id:
         return err("Document not found", 404)
-    return send_file(os.path.join(current_app.config["UPLOAD_DIR"], doc.stored_name),
-                     download_name=doc.filename)
+    path = os.path.join(current_app.config["UPLOAD_DIR"], doc.stored_name)
+    if not os.path.exists(path):
+        return err("This file is no longer stored on the server", 410)
+    if g.user.role in ("officer", "inst_admin", "admin"):
+        record_access(a, f"Viewed document: {doc.doc_type}")
+        db.session.commit()
+    import io
+    with open(path, "rb") as fh:
+        data = vault.decrypt_bytes(fh.read())
+    return send_file(io.BytesIO(data), download_name=doc.filename)
 
 
 @bp.post("/<int:app_id>/submit")
@@ -168,12 +193,16 @@ def submit(app_id):
         return err("Application not found", 404)
     if a.status not in ("draft", "info_requested"):
         return err("Application already submitted", 409)
-    missing = _validate(a.service, a.data or {})
-    if missing:
-        return err("Missing required fields: " + ", ".join(missing))
-    required_docs = a.service.required_documents or []
-    if required_docs and len(a.documents) < len(required_docs):
-        return err(f"Please upload all {len(required_docs)} required documents")
+    clean, problems = forms.validate(a.service, a.data or {})
+    if problems:
+        msg = problems[0] if len(problems) == 1 else f"{len(problems)} answers need attention. " + " ".join(problems[:4])
+        return jsonify({"error": msg, "problems": problems}), 400
+    have = {x.doc_type for x in a.documents}
+    missing_docs = [r["name"] for r in normalize_doc_rules(a.service.required_documents)
+                    if r["required"] and r["name"] not in have]
+    if missing_docs:
+        return err("Please upload: " + ", ".join(missing_docs))
+    a.data = clean  # keep only the answers this service asks for
     if a.fee_usd > 0 and not a.paid:
         return err("Payment is required before submitting", 402)
     a.due_at = now() + timedelta(days=a.service.sla_days)

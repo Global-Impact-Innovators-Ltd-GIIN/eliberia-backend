@@ -30,6 +30,21 @@ def register(c, phone="0770111222"):
     return r.get_json()["token"]
 
 
+PNG = b"\x89PNG\r\n\x1a\n" + b"0" * 64
+JPG = b"\xff\xd8\xff" + b"0" * 64
+SAMPLE = {"pdf": b"%PDF-1.4 test file", "png": PNG, "jpg": JPG}
+
+
+def upload_all(c, tok, aid):
+    """Upload a valid file for every document the institution requires."""
+    rules = c.get(f"/api/applications/{aid}", headers=hdr(tok)).get_json()["service_detail"]["required_documents"]
+    for r in rules:
+        ext = r["formats"][0]
+        resp = c.post(f"/api/applications/{aid}/documents", headers=hdr(tok), content_type="multipart/form-data",
+                      data={"file": (io.BytesIO(SAMPLE[ext]), "f." + ext), "doc_type": r["name"]})
+        assert resp.status_code == 201, resp.get_json()
+
+
 def test_catalog(client):
     r = client.get("/api/services")
     assert r.status_code == 200 and len(r.get_json()) >= 10
@@ -53,11 +68,7 @@ def test_full_digital_flow_with_remote_biometrics(client):
     client.put(f"/api/applications/{aid}", headers=hdr(tok), json={"data": {
         "full_name": "Ma Test", "dob": "1990-01-01", "place_of_birth": "Monrovia",
         "county": "Montserrado", "mother_name": "Mama"}})
-    for t in ("birth", "photo"):
-        r = client.post(f"/api/applications/{aid}/documents", headers=hdr(tok),
-                        data={"file": (io.BytesIO(b"%PDF-1.4 fake"), t + ".pdf"), "doc_type": t},
-                        content_type="multipart/form-data")
-        assert r.status_code == 201
+    upload_all(client, tok, aid)
     # payment required
     assert client.post(f"/api/applications/{aid}/submit", headers=hdr(tok)).status_code == 402
     p = client.post(f"/api/applications/{aid}/pay", headers=hdr(tok),
@@ -113,9 +124,8 @@ def _approved_app(client, tok, service="TIN_REG", beneficiary=None):
         body["beneficiary"] = beneficiary
     a = client.post("/api/applications", headers=hdr(tok), json=body).get_json()
     client.put(f"/api/applications/{a['id']}", headers=hdr(tok),
-               json={"data": {"full_name": "Ma Test", "nin": "N123"}})
-    client.post(f"/api/applications/{a['id']}/documents", headers=hdr(tok),
-                data={"file": (io.BytesIO(b"%PDF-1.4"), "id.pdf")}, content_type="multipart/form-data")
+               json={"data": {"full_name": "Ma Test", "nin": "LR12345678"}})
+    upload_all(client, tok, a["id"])
     assert client.post(f"/api/applications/{a['id']}/submit", headers=hdr(tok)).status_code == 200
     adm = login(client, "+231770000001", "Admin@12345")
     for act in ("start_review", "approve"):
@@ -208,9 +218,8 @@ def test_agent_assisted_flow_and_password_reset(client):
     a = client.post("/api/applications", headers=hdr(ag), json={"service_code": "PASSPORT_RENEW", "citizen_id": cid})
     assert a.status_code == 201 and a.get_json()["assisted"] is True
     aid = a.get_json()["id"]
-    client.put(f"/api/applications/{aid}", headers=hdr(ag), json={"data": {"passport_no": "P123", "dob": "1950-01-01"}})
-    client.post(f"/api/applications/{aid}/documents", headers=hdr(ag),
-                data={"file": (io.BytesIO(b"%PDF-1.4"), "old.pdf")}, content_type="multipart/form-data")
+    client.put(f"/api/applications/{aid}", headers=hdr(ag), json={"data": {"passport_no": "PP0012345", "dob": "1950-01-01"}})
+    upload_all(client, ag, aid)
     p = client.post(f"/api/applications/{aid}/pay", headers=hdr(ag), json={"method": "agent_cash"}).get_json()
     assert client.post(f"/api/applications/payments/{p['txn_ref']}/confirm", headers=hdr(ag), json={}).status_code == 200
     assert client.post(f"/api/applications/{aid}/submit", headers=hdr(ag)).get_json()["status"] == "submitted"
@@ -300,3 +309,157 @@ def test_ussd_channel(client):
     client.application.config["USSD_SECRET"] = "gw-secret"
     assert "Passport" in dial("2", key="gw-secret")
     assert "only works" in dial("2", key="wrong")
+
+
+def _draft(client, tok, code, data):
+    a = client.post("/api/applications", headers=hdr(tok), json={"service_code": code}).get_json()
+    client.put(f"/api/applications/{a['id']}", headers=hdr(tok), json={"data": data})
+    upload_all(client, tok, a["id"])
+    if a["fee_usd"]:
+        p = client.post(f"/api/applications/{a['id']}/pay", headers=hdr(tok), json={"method": "mtn_momo"}).get_json()
+        client.post(f"/api/applications/payments/{p['txn_ref']}/confirm", headers=hdr(tok), json={})
+    return a["id"]
+
+
+def test_identity_document_rules_by_nationality(client):
+    tok = register(client, "0770444001")
+    base = {"full_name": "John Smith", "purpose": "Work"}
+    submit = lambda aid: client.post(f"/api/applications/{aid}/submit", headers=hdr(tok))
+    put = lambda aid, extra: client.put(f"/api/applications/{aid}", headers=hdr(tok), json={"data": {**base, **extra}})
+    aid = _draft(client, tok, "RESIDENT_PERMIT", {**base, "passport_no": "AB12", "passport_no__country": "US"})
+    r = submit(aid)  # a US passport number is 9 digits or a letter and 8 digits
+    assert r.status_code == 400 and "United States passport number" in r.get_json()["error"]
+    put(aid, {"passport_no": "G1234567", "passport_no__country": "US"})  # a valid Ghanaian number is not a US one
+    assert submit(aid).status_code == 400
+    put(aid, {"passport_no": "g1234567", "passport_no__country": "GH"})
+    r = submit(aid)
+    assert r.status_code == 200
+    saved = client.get(f"/api/applications/{aid}", headers=hdr(tok)).get_json()["data"]
+    assert saved["passport_no"] == "G1234567" and saved["passport_no__doc"] == "Passport"
+    # a Liberian National ID cannot be claimed by another nationality
+    from app.services import identity
+    assert "Liberian nationals" in identity.validate("US", "National ID", "LR12345678")[1]
+    assert identity.validate("US", "Passport", "123 456 789") == ("123456789", None)
+    assert identity.validate("LR", "National ID", "LR12345678")[1] is None
+    meta = client.get("/api/meta/identity").get_json()
+    assert meta["passport"]["US"]["example"] and len(meta["countries"]) > 150
+    # the citizen's own profile is held to the same rule
+    assert client.patch("/api/auth/me", headers=hdr(tok), json={"nationality": "US", "id_doc_type": "National ID",
+                                                               "id_number": "123456789"}).status_code == 400
+    assert client.patch("/api/auth/me", headers=hdr(tok), json={"nationality": "US", "id_doc_type": "Passport",
+                                                               "id_number": "123456789"}).get_json()["id_number"] == "123456789"
+
+
+def test_institution_document_rules_and_encryption(client):
+    tok = register(client, "0770444002")
+    a = client.post("/api/applications", headers=hdr(tok), json={"service_code": "NATIONAL_ID_NEW"}).get_json()
+    aid = a["id"]
+    rules = {r["name"]: r for r in a["service_detail"]["required_documents"]}
+    photo = rules["Passport-size photo"]
+    assert photo["formats"] == ["jpg", "png"] and photo["max_mb"] == 2 and photo["note"]
+    up = lambda name, raw, doc: client.post(f"/api/applications/{aid}/documents", headers=hdr(tok),
+                                           content_type="multipart/form-data",
+                                           data={"file": (io.BytesIO(raw), name), "doc_type": doc})
+    assert "JPG, PNG" in up("me.pdf", SAMPLE["pdf"], "Passport-size photo").get_json()["error"]   # wrong format
+    assert "not a real PNG" in up("me.png", b"%PDF-1.4 renamed", "Passport-size photo").get_json()["error"]
+    assert "2 MB or smaller" in up("me.png", PNG + b"0" * (3 * 1024 * 1024), "Passport-size photo").get_json()["error"]
+    assert up("me.png", PNG, "Something else").status_code == 400                                 # not a listed document
+    assert up("me.png", PNG, "Passport-size photo").status_code == 201
+    assert up("me2.jpg", JPG, "Passport-size photo").status_code == 201                           # replaces the first
+    docs = client.get(f"/api/applications/{aid}", headers=hdr(tok)).get_json()["documents"]
+    assert [d["filename"] for d in docs] == ["me2.jpg"]
+    # at rest: the file and the answers are encrypted, yet read back intact
+    import os
+    from app.extensions import db
+    from sqlalchemy import text
+    up_dir = client.application.config["UPLOAD_DIR"]
+    blob = open(os.path.join(up_dir, os.listdir(up_dir)[0]), "rb").read()
+    assert blob.startswith(b"ELV1") and JPG not in blob
+    assert client.get(f"/api/applications/{aid}/documents/{docs[0]['id']}", headers=hdr(tok)).data == JPG
+    client.put(f"/api/applications/{aid}", headers=hdr(tok), json={"data": {"full_name": "Secret Person"}})
+    with client.application.app_context():
+        stored = db.session.execute(text("SELECT data FROM application WHERE id = :i"), {"i": aid}).scalar()
+    assert stored.startswith("enc1:") and "Secret Person" not in stored
+    assert client.get(f"/api/applications/{aid}", headers=hdr(tok)).get_json()["data"]["full_name"] == "Secret Person"
+
+
+def test_institution_portal_and_platform_permissions(client):
+    adm = login(client, "+231770000001", "Admin@12345")
+    insts = {i["code"]: i["id"] for i in client.get("/api/institutions").get_json()}
+    mk = lambda body: client.post("/api/admin/officers", headers=hdr(adm), json={"password": "Staff0pass!", **body})
+    assert mk({"full_name": "LRA Boss", "phone": "0770444010", "role": "inst_admin", "institution_id": insts["LRA"]}).status_code == 201
+    assert mk({"full_name": "Catalog Clerk", "phone": "0770444011", "role": "admin", "perms": ["services"]}).status_code == 201
+    assert mk({"full_name": "No Perms", "phone": "0770444012", "role": "admin", "perms": []}).status_code == 400
+    boss, clerk = login(client, "0770444010", "Staff0pass!"), login(client, "0770444011", "Staff0pass!")
+    # --- the institution runs its own catalog, with its own rules ---
+    mine = client.get("/api/institution/services", headers=hdr(boss)).get_json()
+    assert mine and all(s["institution"]["code"] == "LRA" for s in mine)
+    body = {"code": "tax waiver", "name": "Tax Waiver", "category": "Tax", "fee_usd": 5, "sla_days": 4,
+            "institution_id": insts["NIR"],  # ignored: an institution cannot publish under another's name
+            "required_documents": [{"name": "Waiver letter", "formats": ["pdf"], "max_mb": 1, "note": "Signed and stamped"}],
+            "form_fields": [{"label": "Applicant ID", "type": "identity"}, {"label": "Email", "type": "email", "required": False}]}
+    r = client.post("/api/institution/services", headers=hdr(boss), json=body)
+    assert r.status_code == 201 and r.get_json()["institution"]["code"] == "LRA"
+    assert r.get_json()["required_documents"][0] == {"name": "Waiver letter", "formats": ["pdf"], "max_mb": 1.0,
+                                                     "required": True, "note": "Signed and stamped"}
+    assert client.put("/api/institution/services/NATIONAL_ID_NEW", headers=hdr(boss), json={"fee_usd": 0}).status_code == 404
+    bad = {**body, "code": "x2x", "required_documents": [{"name": "Thing", "formats": ["exe"]}]}
+    assert client.post("/api/institution/services", headers=hdr(boss), json=bad).status_code == 400
+    assert client.put("/api/institution/profile", headers=hdr(boss), json={
+        "guidelines": "Bring originals to collection.", "contact_email": "help@lra.example", "name": "Hacked"}).status_code == 200
+    lra = next(i for i in client.get("/api/institutions").get_json() if i["code"] == "LRA")
+    assert lra["guidelines"].startswith("Bring originals") and lra["name"] == "Liberia Revenue Authority"
+    assert client.post("/api/institution/team", headers=hdr(boss), json={
+        "full_name": "LRA Officer", "phone": "0770444013", "password": "Staff0pass!"}).status_code == 201
+    assert {u["role"] for u in client.get("/api/institution/team", headers=hdr(boss)).get_json()} == {"inst_admin", "officer"}
+    # the institution admin reviews only its own applications
+    tok = register(client, "0770444020")
+    aid = _draft(client, tok, "TAX_WAIVER", {"applicant_id": "LR12345678", "applicant_id__country": "LR",
+                                             "applicant_id__doc": "National ID", "email": "not-an-email"})
+    assert "valid email" in client.post(f"/api/applications/{aid}/submit", headers=hdr(tok)).get_json()["error"]
+    client.put(f"/api/applications/{aid}", headers=hdr(tok), json={"data": {
+        "applicant_id": "LR12345678", "applicant_id__country": "LR", "applicant_id__doc": "National ID"}})
+    assert client.post(f"/api/applications/{aid}/submit", headers=hdr(tok)).status_code == 200
+    assert [x["id"] for x in client.get("/api/staff/applications", headers=hdr(boss)).get_json()] == [aid]
+    other = _draft(client, tok, "NATIONAL_ID_NEW", {})
+    assert client.get(f"/api/staff/applications/{other}", headers=hdr(boss)).status_code == 404
+    # --- a limited platform admin can manage the catalog but nothing else ---
+    assert client.get("/api/admin/services", headers=hdr(clerk)).status_code == 200
+    for path in ("/api/admin/audit", "/api/admin/team", "/api/staff/applications"):
+        assert client.get(path, headers=hdr(clerk)).status_code == 403, path
+    assert client.post("/api/admin/institutions", headers=hdr(clerk), json={"code": "MOA", "name": "Ministry of Agriculture"}).status_code == 403
+    assert client.post("/api/admin/officers", headers=hdr(clerk), json={"full_name": "Sneaky", "phone": "0770444014",
+                                                                        "password": "Staff0pass!", "role": "agent"}).status_code == 403
+    assert client.post("/api/admin/institutions", headers=hdr(adm), json={"code": "MOA", "name": "Ministry of Agriculture"}).status_code == 201
+    assert len(client.get("/api/admin/team", headers=hdr(adm)).get_json()) >= 6
+
+
+def test_data_reuse_access_transparency_and_export(client):
+    tok = register(client, "0770444030")
+    client.patch("/api/auth/me", headers=hdr(tok), json={"county": "Bong", "dob": "1988-05-05", "nationality": "LR",
+                                                         "id_doc_type": "National ID", "id_number": "LR99887766"})
+    first = client.post("/api/applications", headers=hdr(tok), json={"service_code": "TIN_REG"}).get_json()
+    pre = client.get(f"/api/applications/{first['id']}/prefill", headers=hdr(tok)).get_json()["values"]
+    assert pre["full_name"] == "Ma Test" and pre["nin"] == "LR99887766" and pre["nin__doc"] == "National ID"
+    client.put(f"/api/applications/{first['id']}", headers=hdr(tok), json={"data": pre})
+    upload_all(client, tok, first["id"])
+    assert client.post(f"/api/applications/{first['id']}/submit", headers=hdr(tok)).status_code == 200
+    # answers given once are offered again on the next application
+    second = client.post("/api/applications", headers=hdr(tok), json={"service_code": "NATIONAL_ID_NEW"}).get_json()
+    pre2 = client.get(f"/api/applications/{second['id']}/prefill", headers=hdr(tok)).get_json()["values"]
+    assert pre2["full_name"] == "Ma Test" and pre2["dob"] == "1988-05-05" and pre2["county"] == "Bong"
+    # ...but never when applying for someone else
+    kid = client.post("/api/applications", headers=hdr(tok), json={
+        "service_code": "NATIONAL_ID_NEW", "beneficiary": {"name": "Small Child", "relation": "Child"}}).get_json()
+    assert client.get(f"/api/applications/{kid['id']}/prefill", headers=hdr(tok)).get_json()["values"] == {}
+    # the citizen sees which official opened their file
+    assert client.get(f"/api/applications/{first['id']}/access", headers=hdr(tok)).get_json() == []
+    adm = login(client, "+231770000001", "Admin@12345")
+    for _ in range(2):
+        client.get(f"/api/staff/applications/{first['id']}", headers=hdr(adm))
+    seen = client.get(f"/api/applications/{first['id']}/access", headers=hdr(tok)).get_json()
+    assert len(seen) == 1 and seen[0]["viewer_name"] == "System Admin" and seen[0]["organisation"] == "eLiberia platform team"
+    other = register(client, "0770444031")
+    assert client.get(f"/api/applications/{first['id']}/access", headers=hdr(other)).status_code == 404
+    export = client.get("/api/me/export", headers=hdr(tok)).get_json()
+    assert len(export["applications"]) == 3 and export["staff_access"] and export["profile"]["id_number"] == "LR99887766"

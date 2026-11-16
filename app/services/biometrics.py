@@ -29,7 +29,8 @@ def save_image(raw: bytes, prefix: str):
     name = f"{prefix}_{digest[:16]}.bin"
     os.makedirs(current_app.config["UPLOAD_DIR"], exist_ok=True)
     with open(os.path.join(current_app.config["UPLOAD_DIR"], name), "wb") as f:
-        f.write(raw)
+        from . import vault
+        f.write(vault.encrypt_bytes(raw))  # encrypted at rest
     return name, digest
 
 

@@ -99,7 +99,7 @@ def assistant():
             idc += " plus a one-time fingerprint visit"
         parts.append(f"{s.name} is handled by the {s.institution.name}. It costs {fee}, takes about "
                      f"{s.sla_days} working days, and needs {idc}. Documents: "
-                     f"{', '.join(s.required_documents) or 'none'}.")
+                     f"{', '.join(str(x.get('name') if isinstance(x, dict) else x) for x in (s.required_documents or [])) or 'none'}.")
     if not parts:
         parts.append("I could not match that to a service. Try the name of what you need, such as "
                      "'passport', 'driver license', 'business registration' or 'birth certificate'.")

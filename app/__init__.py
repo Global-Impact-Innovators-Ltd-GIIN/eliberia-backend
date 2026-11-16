@@ -13,8 +13,8 @@ def create_app(config=None):
     CORS(app, origins=app.config["CORS_ORIGINS"])
     db.init_app(app)
 
-    from .routes import agent, applications, auth, catalog, extras, public, staff
-    for m in (auth, public, catalog, applications, staff, agent, extras):
+    from .routes import agent, applications, auth, catalog, extras, org, public, staff
+    for m in (auth, public, catalog, applications, staff, agent, extras, org):
         app.register_blueprint(m.bp)
 
     @app.get("/api/health")
@@ -58,8 +58,11 @@ def _ensure_columns():
     wanted = {
         "user": {"failed_logins": "INTEGER DEFAULT 0", "locked_until": "TIMESTAMP",
                  "otp_attempts": "INTEGER DEFAULT 0", "token_version": "INTEGER DEFAULT 0",
-                 "otp_purpose": "VARCHAR(12)"},
+                 "otp_purpose": "VARCHAR(12)", "nationality": "VARCHAR(2)", "id_doc_type": "VARCHAR(20)",
+                 "id_number": "VARCHAR(40)", "admin_perms": "TEXT"},
         "application": {"bill_id": "VARCHAR(20)", "beneficiary": "TEXT", "agent_id": "INTEGER"},
+        "institution": {"guidelines": "TEXT", "contact_phone": "VARCHAR(30)", "contact_email": "VARCHAR(120)"},
+        "service": {"seed_version": "INTEGER DEFAULT 0"},
     }
     insp = inspect(db.engine)
     for table, cols in wanted.items():

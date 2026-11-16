@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 from sqlalchemy.types import Text, TypeDecorator
 
 from .extensions import db
+from .rules import normalize_doc_rules
+from .services import vault
 
 
 def now():
@@ -22,15 +24,32 @@ class JSONText(TypeDecorator):
         return None if value is None else json.loads(value)
 
 
+class EncryptedJSON(TypeDecorator):
+    """JSON that is encrypted before it reaches the database (personal answers on applications)."""
+    impl = Text
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        return None if value is None else vault.encrypt_text(json.dumps(value))
+
+    def process_result_value(self, value, dialect):
+        return None if value is None else json.loads(vault.decrypt_text(value))
+
+
 class Institution(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     code = db.Column(db.String(20), unique=True, nullable=False)
     name = db.Column(db.String(200), nullable=False)
     description = db.Column(db.Text, default="")
     webhook_url = db.Column(db.String(300))  # where verified biometrics/decisions are dispatched
+    guidelines = db.Column(db.Text)  # the institution's own instructions to applicants
+    contact_phone = db.Column(db.String(30))
+    contact_email = db.Column(db.String(120))
 
     def to_dict(self):
-        return {"id": self.id, "code": self.code, "name": self.name, "description": self.description}
+        return {"id": self.id, "code": self.code, "name": self.name, "description": self.description,
+                "guidelines": self.guidelines or "", "contact_phone": self.contact_phone or "",
+                "contact_email": self.contact_email or ""}
 
 
 class User(db.Model):
@@ -55,13 +74,20 @@ class User(db.Model):
     otp_attempts = db.Column(db.Integer, default=0)
     token_version = db.Column(db.Integer, default=0)
     otp_purpose = db.Column(db.String(12))  # verify | consent | reset - a code only works for its purpose
+    # verified identity document, reused to pre-fill applications
+    nationality = db.Column(db.String(2))
+    id_doc_type = db.Column(db.String(20))
+    id_number = db.Column(db.String(40))
+    admin_perms = db.Column(JSONText)  # platform admins: None/["all"] = super admin, else a list of areas
 
     def to_dict(self):
         return {
             "id": self.id, "full_name": self.full_name, "phone": self.phone, "email": self.email,
             "nin": self.nin, "dob": self.dob, "county": self.county, "role": self.role,
             "institution_id": self.institution_id, "phone_verified": self.phone_verified,
-            "language": self.language,
+            "language": self.language, "nationality": self.nationality, "id_doc_type": self.id_doc_type,
+            "id_number": self.id_number,
+            "perms": (self.admin_perms or ["all"]) if self.role == "admin" else None,
         }
 
 
@@ -79,6 +105,7 @@ class Service(db.Model):
     required_documents = db.Column(JSONText, default=list)
     form_fields = db.Column(JSONText, default=list)  # [{name,label,type,required,options}]
     active = db.Column(db.Boolean, default=True)
+    seed_version = db.Column(db.Integer, default=0)  # 99 once an administrator has edited the service
     institution = db.relationship("Institution")
 
     def to_dict(self):
@@ -87,7 +114,8 @@ class Service(db.Model):
             "description": self.description, "institution": self.institution.to_dict(),
             "fee_usd": self.fee_usd, "sla_days": self.sla_days,
             "requires_face": self.requires_face, "requires_fingerprint": self.requires_fingerprint,
-            "required_documents": self.required_documents or [], "form_fields": self.form_fields or [],
+            "required_documents": normalize_doc_rules(self.required_documents),
+            "form_fields": self.form_fields or [],
         }
 
 
@@ -103,7 +131,7 @@ class Application(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
     service_id = db.Column(db.Integer, db.ForeignKey("service.id"), nullable=False)
     status = db.Column(db.String(30), default="draft")
-    data = db.Column(JSONText, default=dict)
+    data = db.Column(EncryptedJSON, default=dict)
     fee_usd = db.Column(db.Float, default=0.0)
     paid = db.Column(db.Boolean, default=False)
     assigned_to = db.Column(db.Integer, db.ForeignKey("user.id"))
@@ -306,3 +334,19 @@ class Message(db.Model):
         return {"id": self.id, "body": self.body, "sender_name": self.sender_name,
                 "sender_role": self.sender_role, "mine": self.sender_id == viewer_id,
                 "created_at": self.created_at.isoformat()}
+
+
+class AccessLog(db.Model):
+    """Who on the government side opened a citizen's application - shown to the citizen."""
+    id = db.Column(db.Integer, primary_key=True)
+    application_id = db.Column(db.Integer, db.ForeignKey("application.id"), nullable=False, index=True)
+    viewer_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    viewer_name = db.Column(db.String(150))
+    viewer_role = db.Column(db.String(20))
+    organisation = db.Column(db.String(200))
+    what = db.Column(db.String(120))
+    created_at = db.Column(db.DateTime, default=now)
+
+    def to_dict(self):
+        return {"viewer_name": self.viewer_name, "viewer_role": self.viewer_role,
+                "organisation": self.organisation, "what": self.what, "created_at": self.created_at.isoformat()}

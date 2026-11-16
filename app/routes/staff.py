@@ -1,32 +1,44 @@
 from flask import Blueprint, g, jsonify, request
 from sqlalchemy import func
+from werkzeug.security import generate_password_hash
 
 from ..extensions import db
-from ..models import (Appointment, Application, ApplicationEvent, AuditLog, BiometricRecord,
+from ..models import (Appointment, Application, ApplicationEvent, AuditLog, BiometricRecord, Institution,
                       Notification, Service, User, now)
 from ..services import biometrics, certificates
-from ..utils import audit, auth_required, err, notify
+from ..utils import (ADMIN_PERMS, audit, auth_required, err, has_perm, need, normalize_phone, notify,
+                     password_problem, record_access)
 
 bp = Blueprint("staff", __name__, url_prefix="/api")
 
+REVIEWERS = ("officer", "inst_admin", "admin")
+INSTITUTION_ROLES = ("officer", "inst_admin")
+
 
 def _scope(q):
-    """Officers only see applications for their own institution; admins see everything."""
-    if g.user.role == "officer":
+    """Institution staff only see their own institution's applications; platform admins see all."""
+    if g.user.role in INSTITUTION_ROLES:
         q = q.join(Service).filter(Service.institution_id == g.user.institution_id)
     return q
 
 
+def _support_gate():
+    """Platform admins need the 'support' permission to open citizens' applications."""
+    if g.user.role == "admin" and not has_perm(g.user, "support"):
+        return err("Your admin account does not have the 'support' permission", 403)
+    return None
+
+
 def _get(app_id):
-    a = _scope(Application.query).filter(Application.id == app_id).first()
-    return a
+    return _scope(Application.query).filter(Application.id == app_id).first()
 
 
 # ---- notifications (any user) ----
 @bp.get("/notifications")
 @auth_required()
 def notifications():
-    items = Notification.query.filter_by(user_id=g.user.id, channel="app").order_by(Notification.id.desc()).limit(50).all()
+    items = (Notification.query.filter_by(user_id=g.user.id, channel="app")
+             .order_by(Notification.id.desc()).limit(50).all())
     return jsonify([n.to_dict() for n in items])
 
 
@@ -38,10 +50,13 @@ def mark_read():
     return jsonify({"ok": True})
 
 
-# ---- officer queue ----
+# ---- review queue ----
 @bp.get("/staff/applications")
-@auth_required("officer", "admin")
+@auth_required(*REVIEWERS)
 def queue():
+    gate = _support_gate()
+    if gate:
+        return gate
     q = _scope(Application.query)
     if request.args.get("status"):
         q = q.filter(Application.status == request.args["status"])
@@ -51,17 +66,25 @@ def queue():
 
 
 @bp.get("/staff/applications/<int:app_id>")
-@auth_required("officer", "admin")
+@auth_required(*REVIEWERS)
 def staff_detail(app_id):
+    gate = _support_gate()
+    if gate:
+        return gate
     a = _get(app_id)
     if not a:
         return err("Application not found", 404)
+    record_access(a, "Opened the application")
+    db.session.commit()
     return jsonify(a.to_dict(full=True))
 
 
 @bp.post("/staff/applications/<int:app_id>/action")
-@auth_required("officer", "admin")
+@auth_required(*REVIEWERS)
 def action(app_id):
+    gate = _support_gate()
+    if gate:
+        return gate
     a = _get(app_id)
     if not a:
         return err("Application not found", 404)
@@ -103,13 +126,13 @@ def action(app_id):
 
 
 @bp.post("/staff/appointments/<int:ap_id>/attend")
-@auth_required("officer", "admin")
+@auth_required(*REVIEWERS)
 def attend(ap_id):
     """Center officer records an in-person biometric capture (fingerprint scanner) completed."""
     ap = db.session.get(Appointment, ap_id)
-    if not ap:
+    a = _get(ap.application_id) if ap else None
+    if not ap or not a:
         return err("Appointment not found", 404)
-    a = db.session.get(Application, ap.application_id)
     ap.status = "attended"
     rec = BiometricRecord(user_id=ap.user_id, application_id=a.id, kind="fingerprint", source="center",
                           sha256="center-" + str(ap.id), liveness_score=1.0, match_score=1.0, status="verified")
@@ -124,9 +147,9 @@ def attend(ap_id):
     return jsonify(ap.to_dict())
 
 
-# ---- admin ----
+# ---- dashboards ----
 @bp.get("/admin/stats")
-@auth_required("officer", "admin")
+@auth_required(*REVIEWERS)
 def stats():
     base = _scope(Application.query)
     by_status = dict(base.with_entities(Application.status, func.count(Application.id))
@@ -134,9 +157,19 @@ def stats():
     overdue = base.filter(Application.due_at < now(),
                           Application.status.in_(["submitted", "in_review"])).count()
     out = {"by_status": by_status, "total": sum(by_status.values()), "overdue": overdue}
+    by_service = (base.with_entities(Application.service_id, func.count(Application.id))
+                  .filter(Application.status != "draft").group_by(Application.service_id).all())
+    names = {s.id: s.name for s in Service.query.filter(Service.id.in_([i for i, _ in by_service] or [0]))}
+    out["by_service"] = sorted(({"name": names.get(i, "?"), "count": n} for i, n in by_service),
+                               key=lambda x: -x["count"])[:6]
     if g.user.role == "admin":
         out["users"] = User.query.filter_by(role="citizen").count()
-        paid = Application.query.filter_by(paid=True)
+        out["institutions"] = Institution.query.count()
+        if has_perm(g.user, "finance"):
+            out["revenue_usd"] = round(sum(a.fee_usd for a in Application.query.filter_by(paid=True)), 2)
+    elif g.user.role == "inst_admin":
+        ids = [s.id for s in Service.query.filter_by(institution_id=g.user.institution_id)]
+        paid = Application.query.filter(Application.paid.is_(True), Application.service_id.in_(ids or [0]))
         out["revenue_usd"] = round(sum(a.fee_usd for a in paid), 2)
     return jsonify(out)
 
@@ -144,29 +177,41 @@ def stats():
 @bp.get("/admin/audit")
 @auth_required("admin")
 def audit_log():
-    return jsonify([x.to_dict() for x in AuditLog.query.order_by(AuditLog.id.desc()).limit(200)])
+    return need("audit") or jsonify([x.to_dict() for x in AuditLog.query.order_by(AuditLog.id.desc()).limit(200)])
 
 
+# ---- platform team ----
 @bp.post("/admin/officers")
 @auth_required("admin")
 def create_officer():
-    from werkzeug.security import generate_password_hash
-    from ..utils import normalize_phone
+    """Create an agent, an institution officer, an institution administrator or a platform admin."""
+    gate = need("team")
+    if gate:
+        return gate
     d = request.get_json(silent=True) or {}
     phone = normalize_phone(d.get("phone"))
-    from ..utils import password_problem
     role = d.get("role", "officer")
-    if role not in ("officer", "agent"):
-        return err("role must be officer or agent")
+    if role not in ("officer", "agent", "inst_admin", "admin"):
+        return err("role must be officer, agent, inst_admin or admin")
     problem = password_problem(d.get("password") or "")
     if not phone or len((d.get("full_name") or "").strip()) < 3 or problem:
         return err(problem or "Full name and a valid phone number are required")
-    if role == "officer" and not d.get("institution_id"):
-        return err("Choose the officer's institution")
+    inst = None
+    if role in INSTITUTION_ROLES:
+        inst = db.session.get(Institution, d.get("institution_id") or 0)
+        if not inst:
+            return err("Choose the institution")
+    perms = None
+    if role == "admin":
+        if not has_perm(g.user, "all"):
+            return err("Only a super administrator can add platform administrators", 403)
+        perms = [p for p in (d.get("perms") or []) if p in ADMIN_PERMS]
+        if not perms:
+            return err("Choose at least one permission for this administrator")
     if User.query.filter_by(phone=phone).first():
         return err("Phone already registered", 409)
-    u = User(full_name=d["full_name"].strip(), phone=phone, role=role,
-             institution_id=d.get("institution_id") if role == "officer" else None,
+    u = User(full_name=d["full_name"].strip(), phone=phone, role=role, admin_perms=perms,
+             institution_id=inst.id if inst else None,
              password_hash=generate_password_hash(d["password"]), phone_verified=True)
     db.session.add(u)
     audit(f"admin_create_{role}", phone)

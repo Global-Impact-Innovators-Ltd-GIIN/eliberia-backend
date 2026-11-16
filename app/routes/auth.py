@@ -152,6 +152,17 @@ def update_me():
         if other:
             return err("This NIN is already registered", 409)
         u.nin = d["nin"]
+    if any(k in d for k in ("nationality", "id_doc_type", "id_number")):
+        from ..services import identity
+        if not d.get("id_number"):
+            u.nationality = d.get("nationality") or u.nationality
+            u.id_doc_type, u.id_number = None, None
+        else:
+            number, problem = identity.validate(d.get("nationality") or "", d.get("id_doc_type") or "", d["id_number"])
+            if problem:
+                db.session.rollback()
+                return err(problem)
+            u.nationality, u.id_doc_type, u.id_number = d["nationality"], d["id_doc_type"], number
     audit("profile_update")
     db.session.commit()
     return jsonify(u.to_dict())
