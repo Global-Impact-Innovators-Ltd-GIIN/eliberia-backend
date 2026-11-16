@@ -89,6 +89,11 @@ def auth_required(*roles):
             # tokens are revoked when the user changes password or signs out everywhere
             if payload.get("v", 0) != (user.token_version or 0):
                 return err("Session ended. Please sign in again.", 401)
+            if user.disabled:
+                return err("This account has been disabled", 403)
+            if user.must_change_password and request.endpoint not in PASSWORD_CHANGE_ENDPOINTS:
+                return jsonify({"error": "Choose a new password before continuing - yours was set by someone else.",
+                                "must_change_password": True}), 403
             if roles and user.role not in roles:
                 return err("You do not have permission for this action", 403)
             g.user = user
@@ -102,9 +107,17 @@ def audit(action, detail="", user_id=None):
     db.session.add(AuditLog(user_id=uid, action=action, detail=detail[:300], ip=client_ip()))
 
 
+PASSWORD_CHANGE_ENDPOINTS = ("auth.me", "auth.change_password", "auth.logout_all")
+
+
 def notify(user_id, title, body, channel="app"):
-    """In-app notification. SMS/email delivery plugs in here once a gateway is configured."""
+    """Record a notification and text it: one-time codes always, status updates when SMS_UPDATES is on."""
+    from ..services import sms
     db.session.add(Notification(user_id=user_id, title=title, body=body, channel=channel))
+    if channel == "sms" or current_app.config.get("SMS_UPDATES"):
+        u = db.session.get(User, user_id)
+        if u and not u.disabled:
+            sms.queue(u.phone, body if channel == "sms" else f"eLiberia: {title}. {body}")
 
 
 def gen_otp():

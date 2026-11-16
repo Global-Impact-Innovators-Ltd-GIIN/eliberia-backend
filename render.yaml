@@ -24,4 +24,8 @@ services:
       - key: CORS_ORIGINS
         sync: false   # the Vercel frontend URL, e.g. https://eliberia.vercel.app
       - key: EXPOSE_OTP
-        value: "True" # demo only: no SMS gateway yet. Set False once SMS is wired.
+        value: "True" # demo only: no SMS gateway yet. Set False here once SMS is wired.
+      - key: DEMO_MODE
+        value: "True" # public demo accounts. Set False here after creating your own admin (see README).
+      - key: TASKS_SECRET
+        generateValue: true # copy it into the backend repository's GitHub secrets for the daily job

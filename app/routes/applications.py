@@ -6,10 +6,10 @@ from datetime import timedelta
 from flask import Blueprint, current_app, g, jsonify, request, send_file
 
 from ..extensions import db
-from ..models import (Appointment, Application, ApplicationEvent, BiometricRecord, Document, Feedback,
+from ..models import (Appointment, Application, ApplicationEvent, BiometricRecord, Document, FamilyMember, Feedback,
                       Payment, Service, now)
 from ..rules import check_file, normalize_doc_rules
-from ..services import biometrics, forms, payments, vault
+from ..services import biometrics, forms, payments, storage, vault
 from ..utils import audit, auth_required, err, gen_bill_id, gen_reference, notify, rate_limit, record_access
 from .catalog import CENTERS
 
@@ -62,7 +62,12 @@ def create():
     if not s:
         return err("Service not found", 404)
     ben = d.get("beneficiary") or None
-    if ben:
+    if ben and ben.get("member_id"):
+        m = FamilyMember.query.filter_by(id=ben["member_id"], user_id=owner_id).first()
+        if not m:
+            return err("That family member is not saved on this account", 404)
+        ben = {"name": m.full_name, "relation": m.relation, "member_id": m.id}
+    elif ben:
         name = str(ben.get("name") or "").strip()[:150]
         if len(name) < 3:
             return err("Enter the full name of the person you are applying for")
@@ -150,15 +155,15 @@ def upload_document(app_id):
     if problem:
         return err(problem)
     for old in [x for x in a.documents if x.doc_type == doc_type]:  # a new upload replaces the old one
-        try:
-            os.remove(os.path.join(current_app.config["UPLOAD_DIR"], old.stored_name))
-        except OSError:
-            pass
+        storage.delete(old.stored_name)
         db.session.delete(old)
     stored = uuid.uuid4().hex + ext
-    os.makedirs(current_app.config["UPLOAD_DIR"], exist_ok=True)
-    with open(os.path.join(current_app.config["UPLOAD_DIR"], stored), "wb") as out:
-        out.write(vault.encrypt_bytes(raw))  # encrypted at rest
+    storage.put(stored, vault.encrypt_bytes(raw))  # encrypted at rest
+    if request.form.get("save_to_locker") == "1" and g.user.role == "citizen":
+        from .citizen import save_locker_copy
+        saved = save_locker_copy(g.user.id, doc_type, f.filename, raw)
+        if isinstance(saved, str):
+            return err(saved, 409)
     doc = Document(application=a, doc_type=doc_type,
                    filename=os.path.basename(f.filename)[:200], stored_name=stored,
                    sha256=hashlib.sha256(raw).hexdigest())
@@ -174,16 +179,14 @@ def download_document(app_id, doc_id):
     doc = db.session.get(Document, doc_id)
     if not a or not doc or doc.application_id != a.id:
         return err("Document not found", 404)
-    path = os.path.join(current_app.config["UPLOAD_DIR"], doc.stored_name)
-    if not os.path.exists(path):
+    blob = storage.get(doc.stored_name)
+    if blob is None:
         return err("This file is no longer stored on the server", 410)
     if g.user.role in ("officer", "inst_admin", "admin"):
         record_access(a, f"Viewed document: {doc.doc_type}")
         db.session.commit()
     import io
-    with open(path, "rb") as fh:
-        data = vault.decrypt_bytes(fh.read())
-    return send_file(io.BytesIO(data), download_name=doc.filename)
+    return send_file(io.BytesIO(vault.decrypt_bytes(blob)), download_name=doc.filename)
 
 
 @bp.post("/<int:app_id>/submit")
@@ -228,21 +231,33 @@ def pay(app_id):
         return err("Nothing to pay", 409)
     if d["method"] == "agent_cash" and g.user.role != "agent":
         return err("Cash payments are only taken by agents")
-    p = payments.initiate(a, d["method"], d.get("msisdn") or a.user.phone)
+    if Payment.query.filter_by(application_id=a.id, status="pending").filter(
+            Payment.created_at > now() - timedelta(minutes=10)).first():
+        return err("A payment is already waiting for approval. Check your phone, or try again in 10 minutes.", 409)
+    try:
+        p = payments.initiate(a, d["method"], d.get("msisdn") or a.user.phone)
+    except payments.ProviderError as exc:
+        db.session.rollback()
+        return err(f"{exc}. Please try again in a moment.", 502)
     audit("payment_initiate", p.txn_ref)
     db.session.commit()
-    return jsonify({**p.to_dict(), "message": "Approve the payment prompt on your phone."}), 201
+    msg = {"cash": "Collect the cash, then confirm.", "webhook": "Complete the payment; this page updates once the provider confirms it.",
+           "mtn": "Approve the payment prompt on your phone. This page updates when MTN confirms it."}.get(
+        p.provider, "Approve the payment prompt on your phone.")
+    return jsonify({**p.to_dict(), "message": msg, "confirm_by_user": p.provider in ("mock", "cash")}), 201
 
 
 @bp.post("/payments/<txn_ref>/confirm")
 @auth_required("citizen", "agent")
 def confirm_payment(txn_ref):
     """Mock provider callback. In production this is the provider's signed webhook, not a user call."""
-    if current_app.config["PAYMENT_PROVIDER"] != "mock":
-        return err("Not available", 404)
     p = Payment.query.filter_by(txn_ref=txn_ref).first()
     if not p or not _own(p.application_id):
         return err("Payment not found", 404)
+    if (p.provider or "mock") not in ("mock", "cash"):
+        return err("This payment is confirmed by the payment provider, not on this page", 409)
+    if p.provider == "cash" and g.user.role != "agent":
+        return err("Only the agent who took the cash can confirm it", 403)
     if p.status != "pending":
         return err("Payment already processed", 409)
     payments.settle(p, success=(request.get_json(silent=True) or {}).get("success", True))
@@ -297,17 +312,15 @@ def book(app_id):
     if not a:
         return err("Application not found", 404)
     d = request.get_json(silent=True) or {}
-    if d.get("center") not in CENTERS:
-        return err("Unknown service center")
-    try:
-        from datetime import datetime
-        slot = datetime.fromisoformat(d["slot"]).replace(tzinfo=None)
-    except Exception:
-        return err("A valid ISO date/time 'slot' is required")
-    if slot <= now():
-        return err("Choose a future time slot")
-    if Appointment.query.filter_by(center=d["center"], slot=slot, status="booked").count() >= 5:
-        return err("That slot is full. Please choose another.", 409)
+    from .citizen import parse_slot, slot_problem
+    slot = parse_slot(d.get("slot"))
+    if not slot:
+        return err("Choose a date and time")
+    problem = slot_problem(d.get("center"), slot)
+    if problem:
+        return err(problem, 409 if "full" in problem else 400)
+    if Appointment.query.filter_by(application_id=a.id, status="booked").first():
+        return err("This application already has an appointment. Move it instead of booking another.", 409)
     purpose = d.get("purpose", "biometrics")
     ap = Appointment(application_id=a.id, user_id=a.user_id, center=d["center"], slot=slot, purpose=purpose)
     db.session.add(ap)

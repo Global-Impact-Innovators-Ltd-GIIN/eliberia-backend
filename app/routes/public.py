@@ -3,7 +3,7 @@ import re
 from flask import Blueprint, jsonify, request
 from sqlalchemy import func
 
-from ..models import Application, Certificate, Feedback, Institution, Service
+from ..models import Application, Certificate, Feedback, Institution, Service, now
 from ..services import certificates
 from ..utils import err, rate_limit
 
@@ -21,6 +21,9 @@ def verify_certificate(number):
         return jsonify({"valid": False, "reason": "This certificate failed its signature check."}), 200
     if cert.revoked:
         return jsonify({"valid": False, "reason": "This certificate has been revoked.", **cert.to_dict()})
+    if cert.expires_at and cert.expires_at < now():
+        return jsonify({"valid": False, "reason": f"This certificate expired on {cert.expires_at:%d %B %Y}.",
+                        **cert.to_dict()})
     return jsonify({"valid": True, **cert.to_dict()})
 
 

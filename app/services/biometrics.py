@@ -27,10 +27,8 @@ FACE_MATCH_MIN = 0.75
 def save_image(raw: bytes, prefix: str):
     digest = hashlib.sha256(raw).hexdigest()
     name = f"{prefix}_{digest[:16]}.bin"
-    os.makedirs(current_app.config["UPLOAD_DIR"], exist_ok=True)
-    with open(os.path.join(current_app.config["UPLOAD_DIR"], name), "wb") as f:
-        from . import vault
-        f.write(vault.encrypt_bytes(raw))  # encrypted at rest
+    from . import storage, vault
+    storage.put(name, vault.encrypt_bytes(raw))  # encrypted at rest
     return name, digest
 
 

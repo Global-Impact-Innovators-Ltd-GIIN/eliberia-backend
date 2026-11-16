@@ -20,11 +20,15 @@ def login(c, phone, pw):
     r = c.post("/api/auth/login", json={"phone": phone, "password": pw}).get_json()
     if r.get("two_factor"):  # staff and agents confirm with a one-time code
         r = c.post("/api/auth/login/verify", json={"phone": phone, "otp": r["dev_otp"]}).get_json()
+    if r["user"].get("must_change_password"):  # temporary password from an administrator
+        r = c.post("/api/auth/change-password", headers=hdr(r["token"]),
+                   json={"current_password": pw, "new_password": pw + "x9"}).get_json()
     return r["token"]
 
 
 def register(c, phone="0770111222"):
-    r = c.post("/api/auth/register", json={"full_name": "Ma Test", "phone": phone, "password": "Passw0rd!"})
+    r = c.post("/api/auth/register", json={"full_name": "Ma Test", "phone": phone, "password": "Passw0rd!",
+                                            "accept_terms": True})
     assert r.status_code == 201
     r = c.post("/api/auth/verify-otp", json={"phone": phone, "otp": r.get_json()["dev_otp"]})
     return r.get_json()["token"]
@@ -185,7 +189,7 @@ def test_account_security(client):
         assert client.post("/api/auth/login", json={"phone": "0770777333", "password": "nope"}).status_code == 401
     assert client.post("/api/auth/login", json={"phone": "0770777333", "password": "N3wPassword!"}).status_code == 423
     # OTP brute force is capped
-    r = client.post("/api/auth/register", json={"full_name": "Otp Test", "phone": "0770777335", "password": "Passw0rd!"})
+    r = client.post("/api/auth/register", json={"full_name": "Otp Test", "phone": "0770777335", "password": "Passw0rd!", "accept_terms": True})
     for _ in range(5):
         client.post("/api/auth/verify-otp", json={"phone": "0770777335", "otp": "000000"})
     assert client.post("/api/auth/verify-otp", json={"phone": "0770777335",
@@ -451,7 +455,8 @@ def test_data_reuse_access_transparency_and_export(client):
     # ...but never when applying for someone else
     kid = client.post("/api/applications", headers=hdr(tok), json={
         "service_code": "NATIONAL_ID_NEW", "beneficiary": {"name": "Small Child", "relation": "Child"}}).get_json()
-    assert client.get(f"/api/applications/{kid['id']}/prefill", headers=hdr(tok)).get_json()["values"] == {}
+    # only the beneficiary's own name, never the account holder's details
+    assert client.get(f"/api/applications/{kid['id']}/prefill", headers=hdr(tok)).get_json()["values"] == {"full_name": "Small Child"}
     # the citizen sees which official opened their file
     assert client.get(f"/api/applications/{first['id']}/access", headers=hdr(tok)).get_json() == []
     adm = login(client, "+231770000001", "Admin@12345")
@@ -513,3 +518,248 @@ def test_institution_review_stages(client):
     assert client.get(f"/api/applications/track/{final['reference']}").get_json()["stage"]["total"] == 3
     # seeded example
     assert len(client.get("/api/services/PASSPORT_NEW").get_json()["workflow"]) == 3
+
+
+# ------------------------------------------------------------------ launch readiness
+import hashlib as _hashlib
+import hmac as _hmac
+import json as _json
+from datetime import date as _date, datetime as _dt, timedelta as _td
+
+
+def _next_weekday(days_ahead=3):
+    d = _date.today() + _td(days=days_ahead)
+    while d.weekday() >= 5:
+        d += _td(days=1)
+    return d
+
+
+def test_consent_and_sms_delivery(client, monkeypatch):
+    from app.services import sms
+    sent = []
+    monkeypatch.setattr(sms, "send", lambda phone, text: sent.append((phone, text)) or True)
+    r = client.post("/api/auth/register", json={"full_name": "No Consent", "phone": "0770600001", "password": "Passw0rd!"})
+    assert r.status_code == 400 and "terms" in r.get_json()["error"]
+    assert sent == []  # a refused request never texts anybody
+    r = client.post("/api/auth/register", json={"full_name": "Yes Consent", "phone": "0770600001",
+                                                "password": "Passw0rd!", "accept_terms": True})
+    assert r.status_code == 201 and r.get_json()["user"]["terms_version"]
+    assert sent and sent[-1][0] == "+231770600001" and r.get_json()["dev_otp"] in sent[-1][1]
+    tok = client.post("/api/auth/verify-otp", json={"phone": "0770600001", "otp": r.get_json()["dev_otp"]}).get_json()["token"]
+    sent.clear()
+    a = client.post("/api/applications", headers=hdr(tok), json={"service_code": "TIN_REG"}).get_json()
+    client.put(f"/api/applications/{a['id']}", headers=hdr(tok), json={"data": {"full_name": "Yes Consent", "nin": "LR12345678"}})
+    upload_all(client, tok, a["id"])
+    client.post(f"/api/applications/{a['id']}/submit", headers=hdr(tok))
+    assert any("submitted" in t.lower() for _, t in sent)  # status updates go out by SMS too
+
+
+def test_live_payments_webhook_refund_and_reconciliation(client):
+    app = client.application
+    app.config.update(PAYMENT_PROVIDER="live", PAYMENT_WEBHOOK_SECRET="whsec-test")
+    tok = register(client, "0770600010")
+    a = client.post("/api/applications", headers=hdr(tok), json={"service_code": "PASSPORT_NEW"}).get_json()
+    p = client.post(f"/api/applications/{a['id']}/pay", headers=hdr(tok), json={"method": "orange_money"}).get_json()
+    assert p["provider"] == "webhook" and p["confirm_by_user"] is False
+    # the browser cannot mark a live payment as paid
+    assert client.post(f"/api/applications/payments/{p['txn_ref']}/confirm", headers=hdr(tok), json={}).status_code == 409
+    assert client.post(f"/api/applications/{a['id']}/pay", headers=hdr(tok), json={"method": "orange_money"}).status_code == 409
+
+    def hook(body, secret="whsec-test"):
+        raw = _json.dumps(body).encode()
+        sig = _hmac.new(secret.encode(), raw, _hashlib.sha256).hexdigest()
+        return client.post("/api/payments/webhook", data=raw, headers={"X-Signature": sig, "Content-Type": "application/json"})
+    ok = {"txn_ref": p["txn_ref"], "status": "SUCCESS", "amount": 50.0, "provider_ref": "OM-123"}
+    assert hook(ok, secret="wrong").status_code == 401
+    assert hook({**ok, "amount": 5.0}).status_code == 409
+    assert hook(ok).get_json()["status"] == "success" and hook(ok).status_code == 200  # retries are harmless
+    st = client.get(f"/api/applications/payments/{p['txn_ref']}/status", headers=hdr(tok)).get_json()
+    assert st["status"] == "success" and st["provider_ref"] == "OM-123"
+    assert client.get(f"/api/applications/{a['id']}", headers=hdr(tok)).get_json()["paid"] is True
+    # refunds and reconciliation are scoped to the institution
+    adm = login(client, "+231770000001", "Admin@12345")
+    insts = {i["code"]: i["id"] for i in client.get("/api/institutions").get_json()}
+    client.post("/api/admin/officers", headers=hdr(adm), json={"full_name": "NIR Boss", "phone": "0770600011",
+                "role": "inst_admin", "institution_id": insts["NIR"], "password": "Staff0pass!"})
+    nir = login(client, "0770600011", "Staff0pass!")
+    assert client.post(f"/api/staff/payments/{p['txn_ref']}/refund", headers=hdr(nir), json={"reason": "Duplicate"}).status_code == 404
+    assert client.get("/api/staff/payments", headers=hdr(nir)).get_json()["count"] == 0
+    rec = client.get("/api/staff/payments", headers=hdr(adm)).get_json()
+    assert rec["totals"]["success"] == 50.0 and rec["by_method"]["orange_money"] == 50.0
+    csv_resp = client.get("/api/staff/payments?format=csv", headers=hdr(adm))
+    assert csv_resp.mimetype == "text/csv" and p["txn_ref"] in csv_resp.get_data(as_text=True)
+    assert client.post(f"/api/staff/payments/{p['txn_ref']}/refund", headers=hdr(adm), json={"reason": "x"}).status_code == 400
+    r = client.post(f"/api/staff/payments/{p['txn_ref']}/refund", headers=hdr(adm), json={"reason": "Paid twice by mistake"})
+    assert r.get_json()["status"] == "refunded"
+    # agents' cash is still confirmed by the agent
+    assert client.post(f"/api/applications/{a['id']}/pay", headers=hdr(tok), json={"method": "agent_cash"}).status_code in (400, 409)
+
+
+def test_demo_lockdown_bootstrap_admin_and_temporary_passwords(tmp_path):
+    from app import create_app
+    db_url = f"sqlite:///{tmp_path}/lock.db"
+    base = {"SQLALCHEMY_DATABASE_URI": db_url, "TESTING": True, "UPLOAD_DIR": str(tmp_path / "up"), "EXPOSE_OTP": True}
+    demo = create_app({**base, "DEMO_MODE": True}).test_client()
+    assert demo.post("/api/auth/login", json={"phone": "0770000001", "password": "Admin@12345"}).status_code == 200
+    real = create_app({**base, "DEMO_MODE": False, "BOOTSTRAP_ADMIN_PHONE": "0770600099",
+                       "BOOTSTRAP_ADMIN_NAME": "Real Admin", "BOOTSTRAP_ADMIN_PASSWORD": "Temp0rary!"}).test_client()
+    r = real.post("/api/auth/login", json={"phone": "0770000001", "password": "Admin@12345"})
+    assert r.status_code == 403 and "disabled" in r.get_json()["error"]
+    r = real.post("/api/auth/login", json={"phone": "0770600099", "password": "Temp0rary!"}).get_json()
+    r = real.post("/api/auth/login/verify", json={"phone": "0770600099", "otp": r["dev_otp"]}).get_json()
+    tok = r["token"]
+    assert r["user"]["must_change_password"] is True
+    blocked = real.get("/api/admin/team", headers=hdr(tok))
+    assert blocked.status_code == 403 and blocked.get_json()["must_change_password"]
+    assert real.post("/api/auth/change-password", headers=hdr(tok),
+                     json={"current_password": "Temp0rary!", "new_password": "Temp0rary!"}).status_code == 400
+    tok = real.post("/api/auth/change-password", headers=hdr(tok),
+                    json={"current_password": "Temp0rary!", "new_password": "MyOwnStr0ng!"}).get_json()["token"]
+    assert real.get("/api/admin/team", headers=hdr(tok)).status_code == 200
+    checks = {c["key"]: c["ok"] for c in real.get("/api/admin/system", headers=hdr(tok)).get_json()["checks"]}
+    assert checks["demo_accounts"] is True and checks["sms"] is False
+    # officers created by an administrator must also replace their temporary password
+    real.post("/api/admin/officers", headers=hdr(tok), json={"full_name": "New Agent", "phone": "0770600098",
+                                                             "role": "agent", "password": "Temp0rary!"})
+    r = real.post("/api/auth/login", json={"phone": "0770600098", "password": "Temp0rary!"}).get_json()
+    r = real.post("/api/auth/login/verify", json={"phone": "0770600098", "otp": r["dev_otp"]}).get_json()
+    assert real.get("/api/agent/stats", headers=hdr(r["token"])).status_code == 403
+
+
+def test_encryption_key_change_is_detected(tmp_path, monkeypatch):
+    from app import create_app
+    from app.config import Config
+    cfg = {"SQLALCHEMY_DATABASE_URI": f"sqlite:///{tmp_path}/k.db", "TESTING": True, "UPLOAD_DIR": str(tmp_path / "up")}
+    assert create_app(cfg).test_client().get("/api/health").get_json()["data_key_ok"] is True
+    monkeypatch.setattr(Config, "DATA_KEY", "a-completely-different-key")
+    h = create_app(cfg).test_client().get("/api/health").get_json()
+    assert h["data_key_ok"] is False and h["status"] == "degraded"
+
+
+def test_daily_tasks_reminders_and_retention(client):
+    from app.extensions import db
+    from app.models import Application, Certificate, Payment
+    from app.services.tasks import run_daily
+    app = client.application
+    tok = register(client, "0770600020")
+    aid = _draft(client, tok, "BUSINESS_RENEW", {"business_name": "Kollie Shop", "reg_no": "BR-1"})
+    assert client.post(f"/api/applications/{aid}/submit", headers=hdr(tok)).status_code == 200
+    adm = login(client, "+231770000001", "Admin@12345")
+    for act in ("start_review", "approve"):
+        assert client.post(f"/api/staff/applications/{aid}/action", headers=hdr(adm), json={"action": act}).status_code == 200
+    wallet = client.get("/api/certificates", headers=hdr(tok)).get_json()[0]
+    assert wallet["expires_at"] and wallet["renewal_code"] == "BUSINESS_RENEW"
+    num = wallet["number"]
+    old_draft = client.post("/api/applications", headers=hdr(tok), json={"service_code": "TIN_REG"}).get_json()["id"]
+    pending = client.post("/api/applications", headers=hdr(tok), json={"service_code": "PASSPORT_NEW"}).get_json()["id"]
+    client.post(f"/api/applications/{pending}/pay", headers=hdr(tok), json={"method": "mtn_momo"})
+    with app.app_context():
+        c = Certificate.query.filter_by(number=num).first()
+        c.expires_at = _dt.utcnow() + _td(days=20)
+        db.session.get(Application, old_draft).updated_at = _dt.utcnow() - _td(days=200)
+        Payment.query.filter_by(application_id=pending).first().created_at = _dt.utcnow() - _td(days=2)
+        db.session.commit()
+        first = run_daily()
+        second = run_daily()
+    assert first["renewal_reminders"] == 1 and second["renewal_reminders"] == 0
+    assert first["drafts_deleted"] >= 1 and first["expired_payments"] == 1
+    assert client.get(f"/api/applications/{old_draft}", headers=hdr(tok)).status_code == 404
+    titles = [n["title"] for n in client.get("/api/notifications", headers=hdr(tok)).get_json()]
+    assert "Renewal reminder" in titles
+    # an altered expiry date breaks the signature; a real expiry is reported as such
+    assert client.get(f"/api/verify/{num}").get_json()["valid"] is False
+    with app.app_context():
+        c = Certificate.query.filter_by(number=num).first()
+        c.expires_at = _dt.utcnow() - _td(days=1)
+        from app.services import certificates
+        c.signature = certificates._sign(c.number, c.application_id, c.holder_name, c.service_name, c.issued_at, c.expires_at)
+        db.session.commit()
+    v = client.get(f"/api/verify/{num}").get_json()
+    assert v["valid"] is False and "expired" in v["reason"]
+    # the scheduler endpoint is locked unless a secret is configured
+    assert client.post("/api/tasks/daily").status_code == 404
+    app.config["TASKS_SECRET"] = "tasks-secret"
+    assert client.post("/api/tasks/daily", headers={"X-Tasks-Key": "nope"}).status_code == 403
+    assert client.post("/api/tasks/daily", headers={"X-Tasks-Key": "tasks-secret"}).status_code == 200
+
+
+def test_document_locker(client):
+    tok, other = register(client, "0770600030"), register(client, "0770600031")
+    up = lambda t, name, raw, label: client.post("/api/locker", headers=hdr(t), content_type="multipart/form-data",
+                                                 data={"file": (io.BytesIO(raw), name), "label": label})
+    assert up(tok, "x.exe", b"MZ", "Thing").status_code == 400
+    assert up(tok, "fake.png", SAMPLE["pdf"], "Photo").status_code == 400
+    photo = up(tok, "me.jpg", JPG, "Passport-size photo").get_json()
+    cert = up(tok, "birth.pdf", SAMPLE["pdf"], "Birth certificate").get_json()
+    assert [x["label"] for x in client.get("/api/locker", headers=hdr(tok)).get_json()] == ["Birth certificate", "Passport-size photo"]
+    assert client.get("/api/locker", headers=hdr(other)).get_json() == []
+    assert client.get(f"/api/locker/{cert['id']}/file", headers=hdr(tok)).data == SAMPLE["pdf"]
+    aid = client.post("/api/applications", headers=hdr(tok), json={"service_code": "NATIONAL_ID_NEW"}).get_json()["id"]
+    attach = lambda t, item, doc: client.post(f"/api/applications/{aid}/documents/from-locker", headers=hdr(t),
+                                              json={"item_id": item, "doc_type": doc})
+    r = attach(tok, cert["id"], "Passport-size photo")  # the institution only accepts JPG/PNG photos
+    assert r.status_code == 400 and "JPG, PNG" in r.get_json()["error"]
+    assert attach(tok, photo["id"], "Passport-size photo").status_code == 201
+    assert attach(tok, cert["id"], "Birth certificate or affidavit").status_code == 201
+    assert attach(other, photo["id"], "Passport-size photo").status_code == 404
+    docs = client.get(f"/api/applications/{aid}", headers=hdr(tok)).get_json()["documents"]
+    assert sorted(d["doc_type"] for d in docs) == ["Birth certificate or affidavit", "Passport-size photo"]
+    # an application upload can be kept in the locker at the same time
+    aid2 = client.post("/api/applications", headers=hdr(tok), json={"service_code": "TIN_REG"}).get_json()["id"]
+    client.post(f"/api/applications/{aid2}/documents", headers=hdr(tok), content_type="multipart/form-data",
+                data={"file": (io.BytesIO(SAMPLE["pdf"]), "nid.pdf"), "doc_type": "National ID", "save_to_locker": "1"})
+    assert len(client.get("/api/locker", headers=hdr(tok)).get_json()) == 3
+    assert client.delete(f"/api/locker/{photo['id']}", headers=hdr(other)).status_code == 404
+    assert client.delete(f"/api/locker/{photo['id']}", headers=hdr(tok)).status_code == 200
+
+
+def test_family_members(client):
+    tok, other = register(client, "0770600040"), register(client, "0770600041")
+    assert client.post("/api/family", headers=hdr(tok), json={"full_name": "Baby", "relation": "Child"}).status_code == 400
+    assert client.post("/api/family", headers=hdr(tok), json={"full_name": "Baby Kollie", "relation": "Pet"}).status_code == 400
+    assert client.post("/api/family", headers=hdr(tok), json={"full_name": "Baby Kollie", "relation": "Child",
+                                                              "dob": "2999-01-01"}).status_code == 400
+    m = client.post("/api/family", headers=hdr(tok), json={"full_name": "Baby Kollie", "relation": "Child",
+                                                           "dob": "2020-03-04"}).get_json()
+    assert client.get("/api/family", headers=hdr(other)).get_json() == []
+    a = client.post("/api/applications", headers=hdr(tok), json={"service_code": "NATIONAL_ID_NEW",
+                                                                 "beneficiary": {"member_id": m["id"]}}).get_json()
+    assert a["beneficiary"]["name"] == "Baby Kollie" and a["beneficiary"]["relation"] == "Child"
+    pre = client.get(f"/api/applications/{a['id']}/prefill", headers=hdr(tok)).get_json()["values"]
+    assert pre == {"full_name": "Baby Kollie", "dob": "2020-03-04"}
+    assert client.post("/api/applications", headers=hdr(other), json={
+        "service_code": "TIN_REG", "beneficiary": {"member_id": m["id"]}}).status_code == 404
+
+
+def test_appointment_slots_reschedule_cancel_and_delivery(client):
+    client.application.config["CENTER_SLOT_CAPACITY"] = 1
+    tok, other = register(client, "0770600050"), register(client, "0770600051")
+    center = client.get("/api/centers").get_json()[0]
+    day = _next_weekday()
+    s = client.get(f"/api/slots?center={center}&date={day.isoformat()}").get_json()
+    assert not s["closed"] and s["slots"][0]["time"] == "09:00" and len(s["slots"]) == 14
+    sat = day + _td(days=(5 - day.weekday()) % 7)
+    assert client.get(f"/api/slots?center={center}&date={sat.isoformat()}").get_json()["closed"] is True
+    aid = client.post("/api/applications", headers=hdr(tok), json={"service_code": "TIN_REG"}).get_json()["id"]
+    aid2 = client.post("/api/applications", headers=hdr(other), json={"service_code": "TIN_REG"}).get_json()["id"]
+    book = lambda t, app_id, when: client.post(f"/api/applications/{app_id}/appointments", headers=hdr(t),
+                                                json={"center": center, "slot": f"{day.isoformat()}T{when}"})
+    assert book(tok, aid, "09:10").status_code == 400  # not on the grid
+    ap = book(tok, aid, "09:00").get_json()
+    assert book(tok, aid, "10:00").status_code == 409  # one appointment per application
+    assert book(other, aid2, "09:00").status_code == 409  # capacity 1: full
+    after = client.get(f"/api/slots?center={center}&date={day.isoformat()}").get_json()["slots"][0]
+    assert after["left"] == 0
+    assert client.put(f"/api/appointments/{ap['id']}", headers=hdr(other), json={"slot": f"{day}T11:00"}).status_code == 404
+    moved = client.put(f"/api/appointments/{ap['id']}", headers=hdr(tok), json={"slot": f"{day.isoformat()}T11:00"}).get_json()
+    assert moved["slot"].endswith("11:00:00")
+    assert book(other, aid2, "09:00").status_code == 201  # the freed slot can be taken
+    assert client.post(f"/api/appointments/{ap['id']}/cancel", headers=hdr(tok)).get_json()["status"] == "cancelled"
+    assert client.post(f"/api/appointments/{ap['id']}/cancel", headers=hdr(tok)).status_code == 409
+    # delivery preference
+    assert client.put(f"/api/applications/{aid}/delivery", headers=hdr(tok), json={"method": "courier", "address": "Short"}).status_code == 400
+    r = client.put(f"/api/applications/{aid}/delivery", headers=hdr(tok),
+                   json={"method": "courier", "address": "House 12, behind the Total station, Sinkor"}).get_json()
+    assert r["delivery"]["method"] == "courier" and r["delivery"]["phone"] == "+231770600050"
+    assert client.put(f"/api/applications/{aid}/delivery", headers=hdr(tok),
+                      json={"method": "collect", "center": center}).get_json()["delivery"]["center"] == center

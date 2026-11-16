@@ -1,4 +1,4 @@
-from flask import Blueprint, g, jsonify, request
+from flask import Blueprint, current_app, g, jsonify, request
 from sqlalchemy import func
 from werkzeug.security import generate_password_hash
 
@@ -250,7 +250,8 @@ def create_officer():
         return err("Phone already registered", 409)
     u = User(full_name=d["full_name"].strip(), phone=phone, role=role, admin_perms=perms,
              institution_id=inst.id if inst else None,
-             password_hash=generate_password_hash(d["password"]), phone_verified=True)
+             password_hash=generate_password_hash(d["password"]), phone_verified=True,
+             must_change_password=current_app.config["FORCE_PASSWORD_CHANGE"])
     db.session.add(u)
     audit(f"admin_create_{role}", phone)
     db.session.commit()

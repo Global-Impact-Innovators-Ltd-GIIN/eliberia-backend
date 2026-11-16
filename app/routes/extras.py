@@ -65,7 +65,10 @@ def unread_count():
 def my_certificates():
     rows = (db.session.query(Certificate, Application).join(Application, Application.id == Certificate.application_id)
             .filter(Application.user_id == g.user.id).order_by(Certificate.id.desc()).all())
-    return jsonify([{**c.to_dict(), "reference": a.reference, "application_id": a.id} for c, a in rows])
+    return jsonify([{**c.to_dict(), "reference": a.reference, "application_id": a.id,
+                     "renewal_code": a.service.renewal_code if a.service.renewal_code and
+                     Service.query.filter_by(code=a.service.renewal_code, active=True).first() else None}
+                    for c, a in rows])
 
 
 @bp.post("/staff/certificates/<number>/revoke")
@@ -172,6 +175,20 @@ def _apply_service(s, d, creating, lock_institution=None):
     s.requires_fingerprint = bool(d.get("requires_fingerprint", s.requires_fingerprint))
     s.required_documents = doc_rules
     s.seed_version = 99  # hand-edited: seed upgrades must never overwrite it
+    if "validity_months" in d:
+        v = d.get("validity_months")
+        try:
+            v = int(v) if v not in (None, "", 0, "0") else None
+        except (TypeError, ValueError):
+            return "Validity must be a number of months"
+        if v is not None and not 1 <= v <= 240:
+            return "Validity must be between 1 and 240 months"
+        s.validity_months = v
+    if "renewal_code" in d:
+        code = str(d.get("renewal_code") or "").strip().upper() or None
+        if code and code != s.code and not Service.query.filter_by(code=code).first():
+            return f"No service with the code {code}"
+        s.renewal_code = code
     s.form_fields = fields
     if "workflow" in d:
         stages = d.get("workflow") or []

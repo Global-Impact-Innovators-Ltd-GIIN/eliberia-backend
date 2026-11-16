@@ -1,11 +1,11 @@
 """Institution portal, platform (super admin) console, and citizen data-control endpoints."""
 import re
 
-from flask import Blueprint, g, jsonify, request
+from flask import Blueprint, current_app, g, jsonify, request
 from werkzeug.security import generate_password_hash
 
 from ..extensions import db
-from ..models import AccessLog, Application, Certificate, Institution, Service, User
+from ..models import AccessLog, Application, Certificate, FamilyMember, Institution, Service, User
 from ..services import forms, identity
 from ..utils import audit, auth_required, err, has_perm, need, normalize_phone, password_problem
 from .applications import _own
@@ -120,7 +120,8 @@ def institution_add_officer():
     if User.query.filter_by(phone=phone).first():
         return err("Phone already registered", 409)
     u = User(full_name=d["full_name"].strip(), phone=phone, role="officer", institution_id=g.user.institution_id,
-             password_hash=generate_password_hash(d["password"]), phone_verified=True)
+             password_hash=generate_password_hash(d["password"]), phone_verified=True,
+             must_change_password=current_app.config["FORCE_PASSWORD_CHANGE"])
     db.session.add(u)
     audit("institution_create_officer", phone)
     db.session.commit()
@@ -198,8 +199,15 @@ def prefill(app_id):
     a = _own(app_id)
     if not a:
         return err("Application not found", 404)
-    if a.beneficiary:  # applying for someone else: their details are not the account holder's
-        return jsonify({"values": {}})
+    if a.beneficiary:  # applying for someone else: never the account holder's details
+        values = {}
+        member = FamilyMember.query.filter_by(id=a.beneficiary.get("member_id") or 0, user_id=a.user_id).first()
+        known = {"full_name": a.beneficiary.get("name"), "child_name": a.beneficiary.get("name"),
+                 "dob": member.dob if member else None}
+        for f in a.service.form_fields or []:
+            if f.get("type") in (None, "text", "date") and known.get(f["name"]):
+                values[f["name"]] = str(known[f["name"]])
+        return jsonify({"values": values})
     u = a.user
     profile = {"full_name": u.full_name, "dob": u.dob, "county": u.county, "email": u.email, "phone": u.phone}
     previous = {}

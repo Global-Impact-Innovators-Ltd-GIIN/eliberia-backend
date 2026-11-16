@@ -13,8 +13,18 @@ from ..extensions import db
 from ..models import Certificate, now
 
 
-def _sign(number, application_id, holder, service, issued_at):
-    msg = "|".join([number, str(application_id), holder, service, issued_at.isoformat()])
+def add_months(d, months):
+    import calendar
+    y, m = divmod(d.month - 1 + months, 12)
+    year, month = d.year + y, m + 1
+    return d.replace(year=year, month=month, day=min(d.day, calendar.monthrange(year, month)[1]))
+
+
+def _sign(number, application_id, holder, service, issued_at, expires_at=None):
+    parts = [number, str(application_id), holder, service, issued_at.isoformat()]
+    if expires_at:  # certificates issued before expiry existed keep their original signature
+        parts.append(expires_at.isoformat())
+    msg = "|".join(parts)
     return hmac.new(current_app.config["SECRET_KEY"].encode(), msg.encode(), hashlib.sha256).hexdigest()
 
 
@@ -28,11 +38,15 @@ def issue(application):
     cert = Certificate(number=number, application_id=application.id, holder_name=holder,
                        service_name=application.service.name,
                        institution_name=application.service.institution.name, issued_at=issued,
-                       signature=_sign(number, application.id, holder, application.service.name, issued))
+                       signature="")
+    if application.service.validity_months:
+        cert.expires_at = add_months(issued, application.service.validity_months)
+    cert.signature = _sign(number, application.id, holder, application.service.name, issued, cert.expires_at)
     db.session.add(cert)
     return cert
 
 
 def is_authentic(cert):
-    expected = _sign(cert.number, cert.application_id, cert.holder_name, cert.service_name, cert.issued_at)
+    expected = _sign(cert.number, cert.application_id, cert.holder_name, cert.service_name, cert.issued_at,
+                     cert.expires_at)
     return hmac.compare_digest(expected, cert.signature)

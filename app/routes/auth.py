@@ -58,9 +58,12 @@ def register():
     nin = (d.get("nin") or "").strip() or None
     if nin and User.query.filter_by(nin=nin).first():
         return err("This NIN is already registered", 409)
+    if d.get("accept_terms") is not True:
+        return err("Please read and accept the terms of use and privacy notice")
     u = User(full_name=name[:150], phone=phone, email=d.get("email"), nin=nin, dob=d.get("dob"),
              county=d.get("county"), password_hash=generate_password_hash(pw),
-             language=d.get("language", "en"))
+             language=d.get("language", "en"), terms_version=current_app.config["TERMS_VERSION"],
+             terms_accepted_at=now())
     db.session.add(u)
     db.session.flush()
     _send_otp(u)
@@ -117,6 +120,8 @@ def login():
                 audit("account_locked", u.phone, user_id=u.id)
             db.session.commit()
         return err("Incorrect phone number or password", 401)
+    if u.disabled:
+        return err("This account has been disabled. Contact the eLiberia team.", 403)
     if not u.phone_verified:
         return err("Phone number not verified", 403)
     u.failed_logins, u.locked_until = 0, None
@@ -179,7 +184,10 @@ def change_password():
     problem = password_problem(d.get("new_password") or "")
     if problem:
         return err(problem)
+    if check_password_hash(u.password_hash, d["new_password"]):
+        return err("Choose a password different from the current one")
     u.password_hash = generate_password_hash(d["new_password"])
+    u.must_change_password = False
     u.token_version = (u.token_version or 0) + 1  # ends every other session
     notify(u.id, "Password changed", "Your password was changed. All other devices were signed out.")
     audit("password_change")
@@ -234,7 +242,7 @@ def reset():
         return bad
     u.password_hash = generate_password_hash(d["new_password"])
     u.otp_code, u.otp_attempts, u.phone_verified = None, 0, True
-    u.failed_logins, u.locked_until = 0, None
+    u.failed_logins, u.locked_until, u.must_change_password = 0, None, False
     u.token_version = (u.token_version or 0) + 1
     notify(u.id, "Password reset", "Your password was reset. All devices were signed out.")
     audit("password_reset", u.phone, user_id=u.id)

@@ -79,6 +79,11 @@ class User(db.Model):
     id_doc_type = db.Column(db.String(20))
     id_number = db.Column(db.String(40))
     admin_perms = db.Column(JSONText)  # platform admins: None/["all"] = super admin, else a list of areas
+    disabled = db.Column(db.Boolean, default=False)
+    must_change_password = db.Column(db.Boolean, default=False)  # temporary password set by someone else
+    is_demo = db.Column(db.Boolean, default=False)  # seeded demo account, switched off outside demo mode
+    terms_version = db.Column(db.String(20))
+    terms_accepted_at = db.Column(db.DateTime)
 
     def to_dict(self):
         return {
@@ -88,6 +93,7 @@ class User(db.Model):
             "language": self.language, "nationality": self.nationality, "id_doc_type": self.id_doc_type,
             "id_number": self.id_number,
             "perms": (self.admin_perms or ["all"]) if self.role == "admin" else None,
+            "must_change_password": bool(self.must_change_password), "terms_version": self.terms_version,
         }
 
 
@@ -107,6 +113,8 @@ class Service(db.Model):
     active = db.Column(db.Boolean, default=True)
     seed_version = db.Column(db.Integer, default=0)  # 99 once an administrator has edited the service
     workflow = db.Column(JSONText)  # the institution's own review stages, in order
+    validity_months = db.Column(db.Integer)  # how long the issued document is valid; None = no expiry
+    renewal_code = db.Column(db.String(40))  # service a holder uses to renew it
     institution = db.relationship("Institution")
 
     def to_dict(self):
@@ -117,6 +125,7 @@ class Service(db.Model):
             "requires_face": self.requires_face, "requires_fingerprint": self.requires_fingerprint,
             "required_documents": normalize_doc_rules(self.required_documents),
             "form_fields": self.form_fields or [], "workflow": normalize_workflow(self.workflow),
+            "validity_months": self.validity_months, "renewal_code": self.renewal_code,
         }
 
 
@@ -145,6 +154,7 @@ class Application(db.Model):
     agent_id = db.Column(db.Integer, db.ForeignKey("user.id"))  # set when an agent assisted
     stage_index = db.Column(db.Integer, default=0)  # which of the institution's review stages it is at
     stage_actors = db.Column(JSONText)  # user id of whoever completed each finished stage
+    delivery = db.Column(JSONText)  # {"method": "collect"|"courier", ...}
     user = db.relationship("User", foreign_keys=[user_id])
     service = db.relationship("Service")
     events = db.relationship("ApplicationEvent", backref="application",
@@ -163,7 +173,7 @@ class Application(db.Model):
             "service": {"id": self.service.id, "code": self.service.code, "name": self.service.name,
                         "institution": self.service.institution.name},
             "fee_usd": self.fee_usd, "paid": self.paid, "bill_id": self.bill_id,
-            "beneficiary": self.beneficiary, "assisted": bool(self.agent_id),
+            "beneficiary": self.beneficiary, "assisted": bool(self.agent_id), "delivery": self.delivery,
             "created_at": self.created_at.isoformat(), "updated_at": self.updated_at.isoformat(),
             "due_at": self.due_at.isoformat() if self.due_at else None,
             "applicant": {"id": self.user.id, "full_name": self.user.full_name, "phone": self.user.phone},
@@ -219,11 +229,21 @@ class Payment(db.Model):
     status = db.Column(db.String(20), default="pending")  # pending | success | failed
     txn_ref = db.Column(db.String(60), unique=True)
     created_at = db.Column(db.DateTime, default=now)
+    provider = db.Column(db.String(20), default="mock")  # mock | mtn | webhook | cash
+    provider_ref = db.Column(db.String(80), index=True)
+    currency = db.Column(db.String(3), default="USD")
+    settled_at = db.Column(db.DateTime)
+    refunded_at = db.Column(db.DateTime)
+    refunded_by = db.Column(db.Integer)
+    refund_reason = db.Column(db.String(300))
     application = db.relationship("Application")
 
     def to_dict(self):
         return {"id": self.id, "method": self.method, "amount_usd": self.amount_usd,
-                "status": self.status, "txn_ref": self.txn_ref,
+                "status": self.status, "txn_ref": self.txn_ref, "provider": self.provider or "mock",
+                "currency": self.currency or "USD", "provider_ref": self.provider_ref,
+                "settled_at": self.settled_at.isoformat() if self.settled_at else None,
+                "refund_reason": self.refund_reason,
                 "created_at": self.created_at.isoformat()}
 
 
@@ -302,11 +322,14 @@ class Certificate(db.Model):
     issued_at = db.Column(db.DateTime, default=now)
     signature = db.Column(db.String(64), nullable=False)
     revoked = db.Column(db.Boolean, default=False)
+    expires_at = db.Column(db.DateTime)  # covered by the signature when set
+    reminders_sent = db.Column(JSONText)  # renewal reminder thresholds already sent (days before expiry)
 
     def to_dict(self):
         return {"number": self.number, "holder_name": self.holder_name, "service_name": self.service_name,
                 "institution_name": self.institution_name, "issued_at": self.issued_at.isoformat(),
-                "revoked": self.revoked}
+                "revoked": self.revoked, "expires_at": self.expires_at.isoformat() if self.expires_at else None,
+                "expired": bool(self.expires_at and self.expires_at < now())}
 
 
 class Feedback(db.Model):
@@ -359,3 +382,38 @@ class AccessLog(db.Model):
     def to_dict(self):
         return {"viewer_name": self.viewer_name, "viewer_role": self.viewer_role,
                 "organisation": self.organisation, "what": self.what, "created_at": self.created_at.isoformat()}
+
+
+class LockerItem(db.Model):
+    """A document the citizen keeps once and reuses across applications (encrypted in storage)."""
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
+    label = db.Column(db.String(80), nullable=False)
+    filename = db.Column(db.String(200))
+    kind = db.Column(db.String(4))
+    size = db.Column(db.Integer)
+    stored_name = db.Column(db.String(200), nullable=False)
+    sha256 = db.Column(db.String(64))
+    created_at = db.Column(db.DateTime, default=now)
+
+    def to_dict(self):
+        return {"id": self.id, "label": self.label, "filename": self.filename, "kind": self.kind,
+                "size": self.size, "created_at": self.created_at.isoformat()}
+
+
+class FamilyMember(db.Model):
+    """Someone the citizen applies for (a child, an elderly parent)."""
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
+    full_name = db.Column(db.String(150), nullable=False)
+    relation = db.Column(db.String(20), nullable=False)
+    dob = db.Column(db.String(20))
+    created_at = db.Column(db.DateTime, default=now)
+
+    def to_dict(self):
+        return {"id": self.id, "full_name": self.full_name, "relation": self.relation, "dob": self.dob}
+
+
+class SystemSetting(db.Model):
+    key = db.Column(db.String(60), primary_key=True)
+    value = db.Column(db.String(300))

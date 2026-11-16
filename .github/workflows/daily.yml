@@ -1,0 +1,52 @@
+# Runs every day at 02:30 UTC (and on demand from the Actions tab).
+#
+# Repository secrets to add (Settings > Secrets and variables > Actions):
+#   DATABASE_URL  - the database's EXTERNAL connection URL (Render dashboard > database > Connections)
+#   BACKUP_KEY    - a long random passphrase; the backup is encrypted with it. Store a copy offline.
+#   API_URL       - e.g. https://eliberia-backend.onrender.com
+#   TASKS_SECRET  - the same value as the TASKS_SECRET environment variable on Render
+#
+# The backup file is encrypted before it is uploaded, because artifacts of a public repository can be
+# downloaded by any signed-in GitHub user.
+name: daily
+
+on:
+  schedule:
+    - cron: "30 2 * * *"
+  workflow_dispatch:
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    if: ${{ github.repository_owner != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install "SQLAlchemy>=2,<2.1" psycopg2-binary==2.9.9 cryptography==43.0.1
+      - name: Encrypted backup
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          BACKUP_KEY: ${{ secrets.BACKUP_KEY }}
+        run: |
+          if [ -z "$DATABASE_URL" ] || [ -z "$BACKUP_KEY" ]; then echo "Backup secrets not set - skipping"; exit 0; fi
+          python backup.py backup --out "eliberia-$(date -u +%F).backup"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eliberia-backup
+          path: "*.backup"
+          retention-days: 30
+          if-no-files-found: ignore
+
+  tasks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reminders, payment clean-up and data retention
+        env:
+          API_URL: ${{ secrets.API_URL }}
+          TASKS_SECRET: ${{ secrets.TASKS_SECRET }}
+        run: |
+          if [ -z "$API_URL" ] || [ -z "$TASKS_SECRET" ]; then echo "Task secrets not set - skipping"; exit 0; fi
+          curl -fsS --retry 3 --retry-delay 30 --max-time 120 -X POST -H "X-Tasks-Key: $TASKS_SECRET" "$API_URL/api/tasks/daily"

@@ -237,6 +237,25 @@ def _upgrade_v3(s):
     s.seed_version = 3
 
 
+# months of validity and the service used to renew - illustrative until each agency confirms
+VALIDITY = {
+    "NATIONAL_ID_NEW": (60, "NATIONAL_ID_RENEW"), "NATIONAL_ID_RENEW": (60, "NATIONAL_ID_RENEW"),
+    "PASSPORT_NEW": (60, "PASSPORT_RENEW"), "PASSPORT_RENEW": (60, "PASSPORT_RENEW"),
+    "DRIVER_LICENSE_NEW": (60, "DRIVER_LICENSE_RENEW"), "DRIVER_LICENSE_RENEW": (60, "DRIVER_LICENSE_RENEW"),
+    "DRIVER_LICENSE_REPLACE": (60, "DRIVER_LICENSE_RENEW"),
+    "VEHICLE_REG": (12, "VEHICLE_REG_RENEW"), "VEHICLE_REG_RENEW": (12, "VEHICLE_REG_RENEW"),
+    "BUSINESS_REG": (12, "BUSINESS_RENEW"), "BUSINESS_RENEW": (12, "BUSINESS_RENEW"),
+    "RESIDENT_PERMIT": (12, "RESIDENT_PERMIT"), "WORK_PERMIT": (12, "WORK_PERMIT"),
+    "TAX_CLEARANCE": (12, "TAX_CLEARANCE"), "POLICE_CLEARANCE": (6, "POLICE_CLEARANCE"),
+}
+
+
+def _upgrade_v4(s):
+    if s.code in VALIDITY and not s.validity_months:
+        s.validity_months, s.renewal_code = VALIDITY[s.code]
+    s.seed_version = 4
+
+
 def seed(reset_demo=True):
     insts = {}
     for code, name, desc in INSTITUTIONS:
@@ -258,21 +277,50 @@ def seed(reset_demo=True):
             _upgrade_v2(s)
         if (s.seed_version or 0) < 3:
             _upgrade_v3(s)
-    if reset_demo and not User.query.filter_by(role="admin").first():
-        db.session.add(User(full_name="System Admin", phone="+231770000001", role="admin",
-                            password_hash=generate_password_hash("Admin@12345"), phone_verified=True))
-        for code, phone in (("NIR", "+231770000002"), ("MFA", "+231770000003")):
-            db.session.add(User(full_name=f"{code} Officer", phone=phone, role="officer",
-                                institution_id=insts[code].id,
-                                password_hash=generate_password_hash("Officer@12345"), phone_verified=True))
+        if (s.seed_version or 0) < 4:
+            _upgrade_v4(s)
     from flask import current_app
-    if current_app.config.get("EXPOSE_OTP") and not User.query.filter_by(role="agent").first():
-        # demo mode only: a sample agent so the agent desk can be tried
-        db.session.add(User(full_name="Demo Agent (Paynesville)", phone="+231770000004", role="agent",
-                            password_hash=generate_password_hash("Agent@12345"), phone_verified=True))
-    if current_app.config.get("EXPOSE_OTP") and not User.query.filter_by(role="inst_admin").first():
-        # demo mode only: an institution administrator for the National Identification Registry
-        db.session.add(User(full_name="NIR Administrator", phone="+231770000005", role="inst_admin",
-                            institution_id=insts["NIR"].id,
-                            password_hash=generate_password_hash("InstAdmin@12345"), phone_verified=True))
+    demo = bool(current_app.config.get("DEMO_MODE"))
+    # (phone, name, role, institution, password) - public, so only ever active in demo mode
+    demo_accounts = [("+231770000001", "System Admin", "admin", None, "Admin@12345"),
+                     ("+231770000002", "NIR Officer", "officer", "NIR", "Officer@12345"),
+                     ("+231770000003", "MFA Officer", "officer", "MFA", "Officer@12345"),
+                     ("+231770000004", "Demo Agent (Paynesville)", "agent", None, "Agent@12345"),
+                     ("+231770000005", "NIR Administrator", "inst_admin", "NIR", "InstAdmin@12345")]
+    for phone, name, role, inst, pw in demo_accounts:
+        u = User.query.filter_by(phone=phone).first()
+        if u and u.full_name == name and u.role == role:
+            u.is_demo = True  # accounts created by earlier versions of this seed
+        if demo and not u:
+            db.session.add(User(full_name=name, phone=phone, role=role, is_demo=True, phone_verified=True,
+                                institution_id=insts[inst].id if inst else None,
+                                password_hash=generate_password_hash(pw)))
+    db.session.flush()
+    if not demo:
+        for u in User.query.filter(User.is_demo.is_(True), User.disabled.isnot(True)):
+            u.disabled, u.token_version = True, (u.token_version or 0) + 1
+    else:
+        for u in User.query.filter(User.is_demo.is_(True), User.disabled.is_(True)):
+            u.disabled = False
+    _bootstrap_admin(current_app.config)
     db.session.commit()
+
+
+def _bootstrap_admin(cfg):
+    """Create the first real super administrator from BOOTSTRAP_ADMIN_* settings (once)."""
+    from .utils import normalize_phone, password_problem
+    phone = normalize_phone(cfg.get("BOOTSTRAP_ADMIN_PHONE"))
+    pw = cfg.get("BOOTSTRAP_ADMIN_PASSWORD")
+    if not phone or not pw or User.query.filter_by(phone=phone).first():
+        return
+    if password_problem(pw):
+        current_app_logger().error("BOOTSTRAP_ADMIN_PASSWORD is too weak; no administrator was created")
+        return
+    db.session.add(User(full_name=(cfg.get("BOOTSTRAP_ADMIN_NAME") or "Platform Administrator")[:150], phone=phone,
+                        role="admin", admin_perms=["all"], phone_verified=True, must_change_password=True,
+                        password_hash=generate_password_hash(pw)))
+
+
+def current_app_logger():
+    from flask import current_app
+    return current_app.logger

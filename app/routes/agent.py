@@ -52,7 +52,8 @@ def start():
             return err("This NIN is already registered", 409)
         # unusable random password: the citizen sets their own later via "Forgot password"
         u = User(full_name=name[:150], phone=phone, nin=nin, county=d.get("county"),
-                 password_hash=generate_password_hash(secrets.token_urlsafe(32)))
+                 password_hash=generate_password_hash(secrets.token_urlsafe(32)),
+                 terms_version="agent-assisted", terms_accepted_at=now())
         db.session.add(u)
         db.session.flush()
         created = True
