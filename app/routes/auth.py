@@ -16,9 +16,28 @@ LOCK_MINUTES = 15
 MAX_OTP_ATTEMPTS = 5
 
 
-def _send_otp(u):
+def _send_otp(u, purpose="verify"):
     u.otp_code, u.otp_expires, u.otp_attempts = gen_otp(), now() + timedelta(minutes=10), 0
-    notify(u.id, "Verify your phone", f"Your eLiberia code is {u.otp_code}", channel="sms")
+    u.otp_purpose = purpose
+    text = {"verify": "Your eLiberia code is {c}",
+            "reset": "{c} is your eLiberia password reset code. Never share it with anyone."}[purpose]
+    notify(u.id, "eLiberia code", text.format(c=u.otp_code), channel="sms")
+
+
+def _check_otp(u, code, purpose):
+    """Return an error response, or None when the code is right for this purpose."""
+    if (not u or not u.otp_code or (u.otp_purpose or "verify") != purpose
+            or not u.otp_expires or u.otp_expires < now()):
+        return err("Invalid or expired code", 400)
+    if (u.otp_attempts or 0) >= MAX_OTP_ATTEMPTS:
+        u.otp_code = None
+        db.session.commit()
+        return err("Too many wrong codes. Request a new code.", 429)
+    if not hmac.compare_digest(u.otp_code, str(code or "")):
+        u.otp_attempts = (u.otp_attempts or 0) + 1
+        db.session.commit()
+        return err("Invalid or expired code", 400)
+    return None
 
 
 @bp.post("/register")
@@ -57,16 +76,9 @@ def register():
 def verify_otp():
     d = request.get_json(silent=True) or {}
     u = User.query.filter_by(phone=normalize_phone(d.get("phone")) or "").first()
-    if not u or not u.otp_code or not u.otp_expires or u.otp_expires < now():
-        return err("Invalid or expired code", 400)
-    if (u.otp_attempts or 0) >= MAX_OTP_ATTEMPTS:
-        u.otp_code = None
-        db.session.commit()
-        return err("Too many wrong codes. Request a new code.", 429)
-    if not hmac.compare_digest(u.otp_code, str(d.get("otp") or "")):
-        u.otp_attempts = (u.otp_attempts or 0) + 1
-        db.session.commit()
-        return err("Invalid or expired code", 400)
+    bad = _check_otp(u, d.get("otp"), "verify")
+    if bad:
+        return bad
     u.phone_verified, u.otp_code, u.otp_attempts = True, None, 0
     audit("verify_phone", u.phone, user_id=u.id)
     db.session.commit()
@@ -171,3 +183,40 @@ def activity():
     from ..models import AuditLog
     rows = AuditLog.query.filter_by(user_id=g.user.id).order_by(AuditLog.id.desc()).limit(15).all()
     return jsonify([{"action": r.action, "ip": r.ip, "created_at": r.created_at.isoformat()} for r in rows])
+
+
+@bp.post("/forgot")
+@rate_limit("forgot", 5, 600)
+def forgot():
+    """Start a password reset. Also how a citizen registered by an agent sets their first password."""
+    d = request.get_json(silent=True) or {}
+    u = User.query.filter_by(phone=normalize_phone(d.get("phone")) or "").first()
+    out = {"message": "If the account exists, a reset code was sent by SMS."}
+    if u:
+        _send_otp(u, "reset")
+        audit("password_reset_requested", u.phone, user_id=u.id)
+        db.session.commit()
+        if current_app.config["EXPOSE_OTP"]:
+            out["dev_otp"] = u.otp_code
+    return jsonify(out)
+
+
+@bp.post("/reset")
+@rate_limit("reset", 20, 600)
+def reset():
+    d = request.get_json(silent=True) or {}
+    problem = password_problem(d.get("new_password") or "")
+    if problem:
+        return err(problem)
+    u = User.query.filter_by(phone=normalize_phone(d.get("phone")) or "").first()
+    bad = _check_otp(u, d.get("otp"), "reset")
+    if bad:
+        return bad
+    u.password_hash = generate_password_hash(d["new_password"])
+    u.otp_code, u.otp_attempts, u.phone_verified = None, 0, True
+    u.failed_logins, u.locked_until = 0, None
+    u.token_version = (u.token_version or 0) + 1
+    notify(u.id, "Password reset", "Your password was reset. All devices were signed out.")
+    audit("password_reset", u.phone, user_id=u.id)
+    db.session.commit()
+    return jsonify({"token": make_token(u), "user": u.to_dict()})

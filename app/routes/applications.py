@@ -24,10 +24,17 @@ def _log(app_, status, message, actor=None):
 
 
 def _own(app_id):
+    """The application, if the signed-in user may see it: its citizen, the agent who assisted,
+    an officer of the owning institution, or an admin."""
     a = db.session.get(Application, app_id)
-    if not a or (a.user_id != g.user.id and g.user.role == "citizen"):
+    if not a:
         return None
-    return a
+    u = g.user
+    allowed = ((u.role == "citizen" and a.user_id == u.id)
+               or (u.role == "agent" and a.agent_id == u.id)
+               or (u.role == "officer" and a.service.institution_id == u.institution_id)
+               or u.role == "admin")
+    return a if allowed else None
 
 
 def _validate(service, data):
@@ -37,9 +44,19 @@ def _validate(service, data):
 
 
 @bp.post("")
-@auth_required("citizen")
+@auth_required("citizen", "agent")
 def create():
     d = request.get_json(silent=True) or {}
+    owner_id, agent_id = g.user.id, None
+    if g.user.role == "agent":
+        from .agent import active_consent
+        try:
+            owner_id = int(d.get("citizen_id"))
+        except (TypeError, ValueError):
+            return err("citizen_id is required")
+        if not active_consent(g.user.id, owner_id):
+            return err("You do not have this citizen's consent. Ask them for a new code.", 403)
+        agent_id = g.user.id
     s = Service.query.filter_by(code=d.get("service_code"), active=True).first()
     if not s:
         return err("Service not found", 404)
@@ -49,11 +66,11 @@ def create():
         if len(name) < 3:
             return err("Enter the full name of the person you are applying for")
         ben = {"name": name, "relation": str(ben.get("relation") or "Other")[:40]}
-    a = Application(reference=gen_reference(), user_id=g.user.id, service=s,
+    a = Application(reference=gen_reference(), user_id=owner_id, agent_id=agent_id, service=s,
                     data=d.get("data") or {}, fee_usd=s.fee_usd, beneficiary=ben,
                     bill_id=gen_bill_id() if s.fee_usd > 0 else None)
     db.session.add(a)
-    _log(a, "draft", "Application started")
+    _log(a, "draft", "Application started" + (" with agent assistance" if agent_id else ""))
     audit("application_create", a.reference)
     db.session.commit()
     return jsonify(a.to_dict(full=True)), 201
@@ -93,7 +110,7 @@ def detail(app_id):
 
 
 @bp.put("/<int:app_id>")
-@auth_required("citizen")
+@auth_required("citizen", "agent")
 def update(app_id):
     a = _own(app_id)
     if not a:
@@ -106,7 +123,7 @@ def update(app_id):
 
 
 @bp.post("/<int:app_id>/documents")
-@auth_required("citizen")
+@auth_required("citizen", "agent")
 def upload_document(app_id):
     a = _own(app_id)
     if not a:
@@ -144,7 +161,7 @@ def download_document(app_id, doc_id):
 
 
 @bp.post("/<int:app_id>/submit")
-@auth_required("citizen")
+@auth_required("citizen", "agent")
 def submit(app_id):
     a = _own(app_id)
     if not a:
@@ -169,7 +186,7 @@ def submit(app_id):
 
 # ---- payments ----
 @bp.post("/<int:app_id>/pay")
-@auth_required("citizen")
+@auth_required("citizen", "agent")
 def pay(app_id):
     a = _own(app_id)
     if not a:
@@ -179,26 +196,28 @@ def pay(app_id):
         return err("Unsupported payment method")
     if a.paid or a.fee_usd <= 0:
         return err("Nothing to pay", 409)
-    p = payments.initiate(a, d["method"], d.get("msisdn") or g.user.phone)
+    if d["method"] == "agent_cash" and g.user.role != "agent":
+        return err("Cash payments are only taken by agents")
+    p = payments.initiate(a, d["method"], d.get("msisdn") or a.user.phone)
     audit("payment_initiate", p.txn_ref)
     db.session.commit()
     return jsonify({**p.to_dict(), "message": "Approve the payment prompt on your phone."}), 201
 
 
 @bp.post("/payments/<txn_ref>/confirm")
-@auth_required("citizen")
+@auth_required("citizen", "agent")
 def confirm_payment(txn_ref):
     """Mock provider callback. In production this is the provider's signed webhook, not a user call."""
     if current_app.config["PAYMENT_PROVIDER"] != "mock":
         return err("Not available", 404)
     p = Payment.query.filter_by(txn_ref=txn_ref).first()
-    if not p or p.application.user_id != g.user.id:
+    if not p or not _own(p.application_id):
         return err("Payment not found", 404)
     if p.status != "pending":
         return err("Payment already processed", 409)
     payments.settle(p, success=(request.get_json(silent=True) or {}).get("success", True))
     if p.status == "success":
-        notify(g.user.id, "Payment received", f"${p.amount_usd:.2f} for {p.application.reference}")
+        notify(p.application.user_id, "Payment received", f"${p.amount_usd:.2f} for {p.application.reference}")
     audit("payment_" + p.status, p.txn_ref)
     db.session.commit()
     return jsonify(p.to_dict())
@@ -206,7 +225,7 @@ def confirm_payment(txn_ref):
 
 # ---- biometrics ----
 @bp.post("/<int:app_id>/biometrics")
-@auth_required("citizen")
+@auth_required("citizen", "agent")
 def capture_biometric(app_id):
     a = _own(app_id)
     if not a:
@@ -225,7 +244,8 @@ def capture_biometric(app_id):
     liveness, match = biometrics.verify(kind, raw, request.form.get("liveness", 0))
     name, digest = biometrics.save_image(raw, f"bio{a.id}")
     ok = biometrics.is_verified(kind, liveness, match)
-    rec = BiometricRecord(user_id=g.user.id, application_id=a.id, kind=kind, source="remote",
+    rec = BiometricRecord(user_id=a.user_id, application_id=a.id, kind=kind,
+                          source="agent" if g.user.role == "agent" else "remote",
                                      stored_name=name, sha256=digest, liveness_score=liveness,
                                      match_score=match, status="verified" if ok else "failed")
     db.session.add(rec)
@@ -241,7 +261,7 @@ def capture_biometric(app_id):
 
 # ---- appointments ----
 @bp.post("/<int:app_id>/appointments")
-@auth_required("citizen")
+@auth_required("citizen", "agent")
 def book(app_id):
     a = _own(app_id)
     if not a:
@@ -259,9 +279,9 @@ def book(app_id):
     if Appointment.query.filter_by(center=d["center"], slot=slot, status="booked").count() >= 5:
         return err("That slot is full. Please choose another.", 409)
     purpose = d.get("purpose", "biometrics")
-    ap = Appointment(application_id=a.id, user_id=g.user.id, center=d["center"], slot=slot, purpose=purpose)
+    ap = Appointment(application_id=a.id, user_id=a.user_id, center=d["center"], slot=slot, purpose=purpose)
     db.session.add(ap)
-    notify(g.user.id, "Appointment booked", f"{d['center']} on {slot:%d %b %Y %H:%M}")
+    notify(a.user_id, "Appointment booked", f"{d['center']} on {slot:%d %b %Y %H:%M}")
     audit("appointment_book", a.reference)
     db.session.commit()
     return jsonify(ap.to_dict()), 201

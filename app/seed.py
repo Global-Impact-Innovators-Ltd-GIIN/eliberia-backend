@@ -113,4 +113,9 @@ def seed(reset_demo=True):
             db.session.add(User(full_name=f"{code} Officer", phone=phone, role="officer",
                                 institution_id=insts[code].id,
                                 password_hash=generate_password_hash("Officer@12345"), phone_verified=True))
+    from flask import current_app
+    if current_app.config.get("EXPOSE_OTP") and not User.query.filter_by(role="agent").first():
+        # demo mode only: a sample agent so the agent desk can be tried
+        db.session.add(User(full_name="Demo Agent (Paynesville)", phone="+231770000004", role="agent",
+                            password_hash=generate_password_hash("Agent@12345"), phone_verified=True))
     db.session.commit()

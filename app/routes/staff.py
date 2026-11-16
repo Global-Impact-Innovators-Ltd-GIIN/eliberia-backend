@@ -154,13 +154,21 @@ def create_officer():
     from ..utils import normalize_phone
     d = request.get_json(silent=True) or {}
     phone = normalize_phone(d.get("phone"))
-    if not phone or not d.get("full_name") or len(d.get("password", "")) < 8:
-        return err("full_name, phone and an 8+ character password are required")
+    from ..utils import password_problem
+    role = d.get("role", "officer")
+    if role not in ("officer", "agent"):
+        return err("role must be officer or agent")
+    problem = password_problem(d.get("password") or "")
+    if not phone or len((d.get("full_name") or "").strip()) < 3 or problem:
+        return err(problem or "Full name and a valid phone number are required")
+    if role == "officer" and not d.get("institution_id"):
+        return err("Choose the officer's institution")
     if User.query.filter_by(phone=phone).first():
         return err("Phone already registered", 409)
-    u = User(full_name=d["full_name"], phone=phone, role="officer", institution_id=d.get("institution_id"),
+    u = User(full_name=d["full_name"].strip(), phone=phone, role=role,
+             institution_id=d.get("institution_id") if role == "officer" else None,
              password_hash=generate_password_hash(d["password"]), phone_verified=True)
     db.session.add(u)
-    audit("admin_create_officer", phone)
+    audit(f"admin_create_{role}", phone)
     db.session.commit()
     return jsonify(u.to_dict()), 201

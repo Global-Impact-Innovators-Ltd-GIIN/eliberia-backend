@@ -177,3 +177,52 @@ def test_account_security(client):
         client.post("/api/auth/verify-otp", json={"phone": "0770777335", "otp": "000000"})
     assert client.post("/api/auth/verify-otp", json={"phone": "0770777335",
                                                      "otp": r.get_json()["dev_otp"]}).status_code == 429
+
+
+def test_agent_assisted_flow_and_password_reset(client):
+    adm = login(client, "+231770000001", "Admin@12345")
+    for ph in ("0770888001", "0770888002"):
+        assert client.post("/api/admin/officers", headers=hdr(adm), json={
+            "full_name": "Agent " + ph[-1], "phone": ph, "password": "Agent0pass!", "role": "agent"}).status_code == 201
+    ag, ag2 = login(client, "0770888001", "Agent0pass!"), login(client, "0770888002", "Agent0pass!")
+    # unknown citizen needs a name; then gets registered and texted a consent code
+    assert client.post("/api/agent/citizens/start", headers=hdr(ag), json={"phone": "0770888100"}).status_code == 404
+    r = client.post("/api/agent/citizens/start", headers=hdr(ag),
+                    json={"phone": "0770888100", "full_name": "Old Pa Flomo"})
+    assert r.status_code == 201
+    cid, code = r.get_json()["citizen"]["id"], r.get_json()["dev_otp"]
+    # no consent yet -> cannot act
+    assert client.post("/api/applications", headers=hdr(ag),
+                       json={"service_code": "TIN_REG", "citizen_id": cid}).status_code == 403
+    # a consent code cannot be used to reset the citizen's password (account takeover guard)
+    assert client.post("/api/auth/reset", json={"phone": "0770888100", "otp": code,
+                                                "new_password": "Hijack123!"}).status_code == 400
+    assert client.post("/api/agent/citizens/consent", headers=hdr(ag),
+                       json={"phone": "0770888100", "otp": code}).status_code == 200
+    # the other agent has no consent
+    assert client.post("/api/applications", headers=hdr(ag2),
+                       json={"service_code": "TIN_REG", "citizen_id": cid}).status_code == 403
+    a = client.post("/api/applications", headers=hdr(ag), json={"service_code": "PASSPORT_RENEW", "citizen_id": cid})
+    assert a.status_code == 201 and a.get_json()["assisted"] is True
+    aid = a.get_json()["id"]
+    client.put(f"/api/applications/{aid}", headers=hdr(ag), json={"data": {"passport_no": "P123", "dob": "1950-01-01"}})
+    client.post(f"/api/applications/{aid}/documents", headers=hdr(ag),
+                data={"file": (io.BytesIO(b"%PDF-1.4"), "old.pdf")}, content_type="multipart/form-data")
+    p = client.post(f"/api/applications/{aid}/pay", headers=hdr(ag), json={"method": "agent_cash"}).get_json()
+    assert client.post(f"/api/applications/payments/{p['txn_ref']}/confirm", headers=hdr(ag), json={}).status_code == 200
+    assert client.post(f"/api/applications/{aid}/submit", headers=hdr(ag)).get_json()["status"] == "submitted"
+    # isolation: other agent and an unrelated officer cannot open it; citizens cannot use cash
+    assert client.get(f"/api/applications/{aid}", headers=hdr(ag2)).status_code == 404
+    nir = login(client, "+231770000002", "Officer@12345")  # passport belongs to MFA, not NIR
+    assert client.get(f"/api/applications/{aid}", headers=hdr(nir)).status_code == 404
+    st = client.get("/api/agent/stats", headers=hdr(ag)).get_json()
+    assert st["assisted_total"] == 1 and st["commission_usd"] == 0.5
+    assert len(client.get("/api/agent/applications", headers=hdr(ag)).get_json()) == 1
+    # the citizen sets their own password later and finds the application in their account
+    code = client.post("/api/auth/forgot", json={"phone": "0770888100"}).get_json()["dev_otp"]
+    r = client.post("/api/auth/reset", json={"phone": "0770888100", "otp": code, "new_password": "MyOwnPass1"})
+    assert r.status_code == 200
+    mine = client.get("/api/applications", headers=hdr(r.get_json()["token"])).get_json()
+    assert len(mine) == 1 and mine[0]["id"] == aid
+    assert client.post(f"/api/applications/{aid}/pay", headers=hdr(r.get_json()["token"]),
+                       json={"method": "agent_cash"}).status_code in (400, 409)

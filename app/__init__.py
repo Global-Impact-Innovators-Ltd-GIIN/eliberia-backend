@@ -13,8 +13,8 @@ def create_app(config=None):
     CORS(app, origins=app.config["CORS_ORIGINS"])
     db.init_app(app)
 
-    from .routes import applications, auth, catalog, public, staff
-    for m in (auth, public, catalog, applications, staff):
+    from .routes import agent, applications, auth, catalog, public, staff
+    for m in (auth, public, catalog, applications, staff, agent):
         app.register_blueprint(m.bp)
 
     @app.get("/api/health")
@@ -57,8 +57,9 @@ def _ensure_columns():
     from sqlalchemy import inspect, text
     wanted = {
         "user": {"failed_logins": "INTEGER DEFAULT 0", "locked_until": "TIMESTAMP",
-                 "otp_attempts": "INTEGER DEFAULT 0", "token_version": "INTEGER DEFAULT 0"},
-        "application": {"bill_id": "VARCHAR(20)", "beneficiary": "TEXT"},
+                 "otp_attempts": "INTEGER DEFAULT 0", "token_version": "INTEGER DEFAULT 0",
+                 "otp_purpose": "VARCHAR(12)"},
+        "application": {"bill_id": "VARCHAR(20)", "beneficiary": "TEXT", "agent_id": "INTEGER"},
     }
     insp = inspect(db.engine)
     for table, cols in wanted.items():

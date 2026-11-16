@@ -9,7 +9,8 @@ import secrets
 from ..extensions import db
 from ..models import Payment
 
-METHODS = {"orange_money": "Orange Money", "mtn_momo": "MTN MoMo", "card": "Card", "bank": "Bank transfer"}
+METHODS = {"orange_money": "Orange Money", "mtn_momo": "MTN MoMo", "card": "Card", "bank": "Bank transfer",
+           "agent_cash": "Cash collected by agent"}
 
 
 def initiate(application, method, msisdn):

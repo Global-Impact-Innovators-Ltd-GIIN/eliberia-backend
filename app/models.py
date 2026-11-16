@@ -54,6 +54,7 @@ class User(db.Model):
     locked_until = db.Column(db.DateTime)
     otp_attempts = db.Column(db.Integer, default=0)
     token_version = db.Column(db.Integer, default=0)
+    otp_purpose = db.Column(db.String(12))  # verify | consent | reset - a code only works for its purpose
 
     def to_dict(self):
         return {
@@ -112,6 +113,7 @@ class Application(db.Model):
     due_at = db.Column(db.DateTime)
     bill_id = db.Column(db.String(20))  # pay-anywhere bill number (mobile money, bank, agent)
     beneficiary = db.Column(JSONText)  # {"name","relation"} when applying on behalf of someone
+    agent_id = db.Column(db.Integer, db.ForeignKey("user.id"))  # set when an agent assisted
     user = db.relationship("User", foreign_keys=[user_id])
     service = db.relationship("Service")
     events = db.relationship("ApplicationEvent", backref="application",
@@ -124,7 +126,7 @@ class Application(db.Model):
             "service": {"id": self.service.id, "code": self.service.code, "name": self.service.name,
                         "institution": self.service.institution.name},
             "fee_usd": self.fee_usd, "paid": self.paid, "bill_id": self.bill_id,
-            "beneficiary": self.beneficiary,
+            "beneficiary": self.beneficiary, "assisted": bool(self.agent_id),
             "created_at": self.created_at.isoformat(), "updated_at": self.updated_at.isoformat(),
             "due_at": self.due_at.isoformat() if self.due_at else None,
             "applicant": {"id": self.user.id, "full_name": self.user.full_name, "phone": self.user.phone},
@@ -279,3 +281,12 @@ class Feedback(db.Model):
 
     def to_dict(self):
         return {"rating": self.rating, "comment": self.comment, "created_at": self.created_at.isoformat()}
+
+
+class AgentConsent(db.Model):
+    """A citizen's time-limited permission for one agent to act for them (granted with an SMS code)."""
+    id = db.Column(db.Integer, primary_key=True)
+    agent_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    citizen_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    expires_at = db.Column(db.DateTime, nullable=False)
+    created_at = db.Column(db.DateTime, default=now)
