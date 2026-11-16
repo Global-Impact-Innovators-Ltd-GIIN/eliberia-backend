@@ -60,9 +60,10 @@ def _ensure_columns():
                  "otp_attempts": "INTEGER DEFAULT 0", "token_version": "INTEGER DEFAULT 0",
                  "otp_purpose": "VARCHAR(12)", "nationality": "VARCHAR(2)", "id_doc_type": "VARCHAR(20)",
                  "id_number": "VARCHAR(40)", "admin_perms": "TEXT"},
-        "application": {"bill_id": "VARCHAR(20)", "beneficiary": "TEXT", "agent_id": "INTEGER"},
+        "application": {"bill_id": "VARCHAR(20)", "beneficiary": "TEXT", "agent_id": "INTEGER",
+                        "stage_index": "INTEGER DEFAULT 0", "stage_actors": "TEXT"},
         "institution": {"guidelines": "TEXT", "contact_phone": "VARCHAR(30)", "contact_email": "VARCHAR(120)"},
-        "service": {"seed_version": "INTEGER DEFAULT 0"},
+        "service": {"seed_version": "INTEGER DEFAULT 0", "workflow": "TEXT"},
     }
     insp = inspect(db.engine)
     for table, cols in wanted.items():

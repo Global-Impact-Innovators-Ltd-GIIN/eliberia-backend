@@ -95,6 +95,7 @@ def track(reference):
         return err("No application found with that reference or bill ID", 404)
     return jsonify({"reference": a.reference, "service": a.service.name, "status": a.status,
                     "institution": a.service.institution.name, "paid": a.paid, "fee_usd": a.fee_usd,
+                    "stage": a.stage_info(),
                     "due_at": a.due_at.isoformat() if a.due_at else None,
                     "updated_at": a.updated_at.isoformat(),
                     "events": [{"status": e.status, "message": e.message, "created_at": e.created_at.isoformat()}

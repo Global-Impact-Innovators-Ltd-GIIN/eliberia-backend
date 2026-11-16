@@ -463,3 +463,53 @@ def test_data_reuse_access_transparency_and_export(client):
     assert client.get(f"/api/applications/{first['id']}/access", headers=hdr(other)).status_code == 404
     export = client.get("/api/me/export", headers=hdr(tok)).get_json()
     assert len(export["applications"]) == 3 and export["staff_access"] and export["profile"]["id_number"] == "LR99887766"
+
+
+def test_institution_review_stages(client):
+    adm = login(client, "+231770000001", "Admin@12345")
+    insts = {i["code"]: i["id"] for i in client.get("/api/institutions").get_json()}
+    mk = lambda name, phone, role: client.post("/api/admin/officers", headers=hdr(adm), json={
+        "full_name": name, "phone": phone, "role": role, "institution_id": insts["LRA"], "password": "Staff0pass!"})
+    assert mk("LRA Head", "0770555010", "inst_admin").status_code == 201
+    assert mk("Clerk One", "0770555011", "officer").status_code == 201
+    assert mk("Clerk Two", "0770555012", "officer").status_code == 201
+    head, one, two = (login(client, p, "Staff0pass!") for p in ("0770555010", "0770555011", "0770555012"))
+    # the institution defines how its own office works
+    stages = [{"name": "Desk check", "instructions": "Check the letter is signed."},
+              {"name": "Assessment", "separate_officer": True},
+              {"name": "Commissioner sign-off", "requires_admin": True}]
+    body = {"code": "duty waiver", "name": "Duty Waiver", "category": "Tax", "fee_usd": 0, "sla_days": 6,
+            "required_documents": [], "form_fields": [{"label": "Reason", "type": "text"}], "workflow": stages}
+    r = client.post("/api/institution/services", headers=hdr(head), json=body)
+    assert r.status_code == 201 and [s["name"] for s in r.get_json()["workflow"]] == ["Desk check", "Assessment", "Commissioner sign-off"]
+    dup = {**body, "code": "dw2", "workflow": [{"name": "A stage"}, {"name": "a stage"}]}
+    assert client.post("/api/institution/services", headers=hdr(head), json=dup).status_code == 400
+    first_sep = {**body, "code": "dw3", "workflow": [{"name": "Only", "separate_officer": True}]}
+    assert client.post("/api/institution/services", headers=hdr(head), json=first_sep).status_code == 400
+    assert client.get("/api/services/TIN_REG").get_json()["workflow"][0]["name"] == "Review"  # default: one stage
+
+    tok = register(client, "0770555020")
+    aid = _draft(client, tok, "DUTY_WAIVER", {"reason": "Relief goods"})
+    assert client.post(f"/api/applications/{aid}/submit", headers=hdr(tok)).status_code == 200
+    act = lambda who, action, note="": client.post(f"/api/staff/applications/{aid}/action", headers=hdr(who),
+                                                    json={"action": action, "note": note})
+    stage = lambda: client.get(f"/api/applications/{aid}", headers=hdr(tok)).get_json()["stage"]
+    assert act(one, "start_review").status_code == 200 and stage()["name"] == "Desk check" and stage()["total"] == 3
+    assert "final stage" in act(one, "approve").get_json()["error"]            # cannot skip ahead
+    assert act(one, "send_back", "x").status_code == 409                       # nothing before the first stage
+    assert act(one, "advance", "Letter is signed").status_code == 200 and stage()["index"] == 1
+    assert "different officer" in act(one, "advance").get_json()["error"]      # separation of duties
+    assert act(two, "send_back").status_code == 400                            # needs a reason
+    assert act(two, "send_back", "Stamp is missing").status_code == 200 and stage()["name"] == "Desk check"
+    assert act(two, "advance").status_code == 200                              # a different clerk redoes stage 1
+    assert "different officer" in act(two, "advance").get_json()["error"]
+    assert act(one, "advance").status_code == 200 and stage()["name"] == "Commissioner sign-off"
+    assert "institution administrator" in act(one, "approve").get_json()["error"]
+    assert "final stage" in act(head, "advance").get_json()["error"]
+    assert act(head, "approve").status_code == 200
+    final = client.get(f"/api/applications/{aid}", headers=hdr(tok)).get_json()
+    assert final["status"] == "approved" and final["certificate"]
+    assert any("Sent back to stage" in e["message"] for e in final["events"])
+    assert client.get(f"/api/applications/track/{final['reference']}").get_json()["stage"]["total"] == 3
+    # seeded example
+    assert len(client.get("/api/services/PASSPORT_NEW").get_json()["workflow"]) == 3

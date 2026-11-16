@@ -5,6 +5,7 @@ from werkzeug.security import generate_password_hash
 from ..extensions import db
 from ..models import (Appointment, Application, ApplicationEvent, AuditLog, BiometricRecord, Institution,
                       Notification, Service, User, now)
+from ..rules import normalize_workflow
 from ..services import biometrics, certificates
 from ..utils import (ADMIN_PERMS, audit, auth_required, err, has_perm, need, normalize_phone, notify,
                      password_problem, record_access)
@@ -26,6 +27,16 @@ def _support_gate():
     """Platform admins need the 'support' permission to open citizens' applications."""
     if g.user.role == "admin" and not has_perm(g.user, "support"):
         return err("Your admin account does not have the 'support' permission", 403)
+    return None
+
+
+def _stage_gate(stage, index, actors):
+    """Why the signed-in person may not complete this stage, or None."""
+    if stage["requires_admin"] and g.user.role == "officer":
+        return f"The '{stage['name']}' stage must be completed by an institution administrator."
+    if stage["separate_officer"] and index > 0 and len(actors) >= index and actors[index - 1] == g.user.id:
+        return (f"The '{stage['name']}' stage must be completed by a different officer from the one who "
+                f"completed the previous stage.")
     return None
 
 
@@ -91,9 +102,30 @@ def action(app_id):
     d = request.get_json(silent=True) or {}
     act, note = d.get("action"), (d.get("note") or "").strip()
     svc = a.service
+    wf = normalize_workflow(svc.workflow)
+    i = min(a.stage_index or 0, len(wf) - 1)
+    actors = list(a.stage_actors or [])
     if act == "start_review" and a.status == "submitted":
-        a.assigned_to = g.user.id
-        status, msg = "in_review", "Officer started reviewing"
+        a.assigned_to, a.stage_index, a.stage_actors = g.user.id, 0, []
+        status, msg = "in_review", ("Officer started reviewing" if len(wf) == 1
+                                    else f"Review started at stage 1 of {len(wf)}: {wf[0]['name']}")
+    elif act == "advance" and a.status == "in_review":
+        if i >= len(wf) - 1:
+            return err("This is the final stage. Approve or reject the application.", 409)
+        gate = _stage_gate(wf[i], i, actors)
+        if gate:
+            return err(gate, 409)
+        a.stage_actors, a.stage_index, a.assigned_to = actors[:i] + [g.user.id], i + 1, None
+        status = "in_review"
+        msg = (f"Stage '{wf[i]['name']}' completed" + (f" - {note}" if note else "")
+               + f". Now at stage {i + 2} of {len(wf)}: {wf[i + 1]['name']}.")
+    elif act == "send_back" and a.status == "in_review":
+        if i == 0:
+            return err("This is the first stage. Ask the applicant for more information instead.", 409)
+        if not note:
+            return err("Explain why you are sending it back")
+        a.stage_actors, a.stage_index, a.assigned_to = actors[:i - 1], i - 1, None
+        status, msg = "in_review", f"Sent back to stage '{wf[i - 1]['name']}': {note}"
     elif act == "request_info" and a.status in ("in_review", "submitted"):
         if not note:
             return err("Tell the applicant what is missing")
@@ -101,6 +133,12 @@ def action(app_id):
     elif act == "request_biometrics" and a.status == "in_review":
         status, msg = "biometric_pending", note or "Please complete identity verification"
     elif act == "approve" and a.status == "in_review":
+        if i < len(wf) - 1:
+            return err(f"Complete the '{wf[i]['name']}' stage first. Approval happens at the final stage, "
+                       f"'{wf[-1]['name']}'.", 409)
+        gate = _stage_gate(wf[i], i, actors)
+        if gate:
+            return err(gate, 409)
         if svc.requires_face and not any(b.status == "dispatched" and b.kind == "face" for b in
                                         BiometricRecord.query.filter_by(application_id=a.id)):
             return err("Face verification is required before approval. Request biometrics first.", 409)

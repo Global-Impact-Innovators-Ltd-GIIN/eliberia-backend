@@ -211,6 +211,32 @@ def _upgrade_v2(s):
     s.seed_version = 2
 
 
+STAGES = {
+    "PASSPORT_NEW": [("Document check", "Confirm the ID and photo meet the rules."),
+                     ("Identity verification", "Confirm the face and fingerprint evidence."),
+                     ("Issuance approval", "Final check before the passport is printed.")],
+    "BUSINESS_REG": [("Name search", "Check the proposed name is available and permitted."),
+                     ("Registration approval", "Confirm documents and approve.")],
+    "WORK_PERMIT": [("Employer verification", "Confirm the employer is registered and compliant."),
+                    ("Permit decision", "Decide on the permit.")],
+    "CONSTRUCTION_PERMIT": [("Technical review", "Review the drawings against the building code."),
+                            ("Permit approval", "Approve or reject the permit.")],
+    "LAND_DEED_REG": [("Records search", "Search for conflicting deeds."),
+                      ("Survey validation", "Check the survey plan against the parcel."),
+                      ("Registrar sign-off", "Final registration by the administrator.")],
+}
+
+
+def _upgrade_v3(s):
+    """Example review stages on a few seeded services; edited services are never touched."""
+    if s.code in STAGES and not s.workflow:
+        last = len(STAGES[s.code]) - 1
+        s.workflow = [{"name": n, "instructions": t, "separate_officer": False,
+                       "requires_admin": s.code == "LAND_DEED_REG" and k == last}
+                      for k, (n, t) in enumerate(STAGES[s.code])]
+    s.seed_version = 3
+
+
 def seed(reset_demo=True):
     insts = {}
     for code, name, desc in INSTITUTIONS:
@@ -230,6 +256,8 @@ def seed(reset_demo=True):
     for s in Service.query:
         if (s.seed_version or 0) < 2:
             _upgrade_v2(s)
+        if (s.seed_version or 0) < 3:
+            _upgrade_v3(s)
     if reset_demo and not User.query.filter_by(role="admin").first():
         db.session.add(User(full_name="System Admin", phone="+231770000001", role="admin",
                             password_hash=generate_password_hash("Admin@12345"), phone_verified=True))

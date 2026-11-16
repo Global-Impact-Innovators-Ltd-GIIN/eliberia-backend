@@ -9,7 +9,7 @@ from ..extensions import db
 from ..models import (Application, ApplicationEvent, Certificate, Institution, Message, Notification,
                       Service, User)
 from ..services import certificates
-from ..rules import normalize_doc_rules
+from ..rules import MAX_STAGES, normalize_doc_rules, normalize_workflow
 from ..services import forms, identity
 from ..utils import audit, auth_required, err, need, normalize_phone, notify, rate_limit
 from .applications import _own
@@ -173,6 +173,18 @@ def _apply_service(s, d, creating, lock_institution=None):
     s.required_documents = doc_rules
     s.seed_version = 99  # hand-edited: seed upgrades must never overwrite it
     s.form_fields = fields
+    if "workflow" in d:
+        stages = d.get("workflow") or []
+        if not isinstance(stages, list) or len(stages) > MAX_STAGES:
+            return f"A service can have at most {MAX_STAGES} review stages"
+        names = [str((x.get("name") if isinstance(x, dict) else x) or "").strip() for x in stages]
+        if any(len(n) < 2 for n in names):
+            return "Every review stage needs a name"
+        if len({n.lower() for n in names}) != len(names):
+            return "Two review stages share the same name"
+        if stages and isinstance(stages[0], dict) and stages[0].get("separate_officer"):
+            return "The first stage cannot require a different officer - nobody has acted before it"
+        s.workflow = normalize_workflow(stages) if stages else None
     s.active = bool(d.get("active", True if creating else s.active))
     return None
 

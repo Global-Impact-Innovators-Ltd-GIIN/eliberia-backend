@@ -53,3 +53,21 @@ def check_file(rule, filename, raw):
     if len(raw) < 8:
         return "The file is empty."
     return None
+
+
+DEFAULT_STAGE = {"name": "Review", "instructions": "", "separate_officer": False, "requires_admin": False}
+MAX_STAGES = 8
+
+
+def normalize_workflow(items):
+    """The review stages an institution defined for a service; a single 'Review' stage when none are set."""
+    out = []
+    for it in items or []:
+        if isinstance(it, str):
+            it = {"name": it}
+        name = str(it.get("name") or "").strip()[:60]
+        if name:
+            out.append({"name": name, "instructions": str(it.get("instructions") or "").strip()[:300],
+                        "separate_officer": bool(it.get("separate_officer")),
+                        "requires_admin": bool(it.get("requires_admin"))})
+    return out[:MAX_STAGES] or [dict(DEFAULT_STAGE)]

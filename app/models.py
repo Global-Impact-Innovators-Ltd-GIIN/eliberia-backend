@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from sqlalchemy.types import Text, TypeDecorator
 
 from .extensions import db
-from .rules import normalize_doc_rules
+from .rules import normalize_doc_rules, normalize_workflow
 from .services import vault
 
 
@@ -106,6 +106,7 @@ class Service(db.Model):
     form_fields = db.Column(JSONText, default=list)  # [{name,label,type,required,options}]
     active = db.Column(db.Boolean, default=True)
     seed_version = db.Column(db.Integer, default=0)  # 99 once an administrator has edited the service
+    workflow = db.Column(JSONText)  # the institution's own review stages, in order
     institution = db.relationship("Institution")
 
     def to_dict(self):
@@ -115,7 +116,7 @@ class Service(db.Model):
             "fee_usd": self.fee_usd, "sla_days": self.sla_days,
             "requires_face": self.requires_face, "requires_fingerprint": self.requires_fingerprint,
             "required_documents": normalize_doc_rules(self.required_documents),
-            "form_fields": self.form_fields or [],
+            "form_fields": self.form_fields or [], "workflow": normalize_workflow(self.workflow),
         }
 
 
@@ -142,15 +143,23 @@ class Application(db.Model):
     bill_id = db.Column(db.String(20))  # pay-anywhere bill number (mobile money, bank, agent)
     beneficiary = db.Column(JSONText)  # {"name","relation"} when applying on behalf of someone
     agent_id = db.Column(db.Integer, db.ForeignKey("user.id"))  # set when an agent assisted
+    stage_index = db.Column(db.Integer, default=0)  # which of the institution's review stages it is at
+    stage_actors = db.Column(JSONText)  # user id of whoever completed each finished stage
     user = db.relationship("User", foreign_keys=[user_id])
     service = db.relationship("Service")
     events = db.relationship("ApplicationEvent", backref="application",
                              order_by="ApplicationEvent.id", cascade="all, delete-orphan")
     documents = db.relationship("Document", backref="application", cascade="all, delete-orphan")
 
+    def stage_info(self):
+        wf = normalize_workflow(self.service.workflow)
+        i = min(self.stage_index or 0, len(wf) - 1)
+        return {"index": i, "total": len(wf), "name": wf[i]["name"], "instructions": wf[i]["instructions"],
+                "names": [w["name"] for w in wf]}
+
     def to_dict(self, full=False):
         d = {
-            "id": self.id, "reference": self.reference, "status": self.status,
+            "id": self.id, "reference": self.reference, "status": self.status, "stage": self.stage_info(),
             "service": {"id": self.service.id, "code": self.service.code, "name": self.service.name,
                         "institution": self.service.institution.name},
             "fee_usd": self.fee_usd, "paid": self.paid, "bill_id": self.bill_id,
