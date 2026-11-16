@@ -13,8 +13,8 @@ def create_app(config=None):
     CORS(app, origins=app.config["CORS_ORIGINS"])
     db.init_app(app)
 
-    from .routes import agent, applications, auth, catalog, public, staff
-    for m in (auth, public, catalog, applications, staff, agent):
+    from .routes import agent, applications, auth, catalog, extras, public, staff
+    for m in (auth, public, catalog, applications, staff, agent, extras):
         app.register_blueprint(m.bp)
 
     @app.get("/api/health")

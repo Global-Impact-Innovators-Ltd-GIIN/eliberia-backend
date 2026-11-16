@@ -290,3 +290,19 @@ class AgentConsent(db.Model):
     citizen_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
     expires_at = db.Column(db.DateTime, nullable=False)
     created_at = db.Column(db.DateTime, default=now)
+
+
+class Message(db.Model):
+    """Support conversation between the applicant (or their agent) and the reviewing institution."""
+    id = db.Column(db.Integer, primary_key=True)
+    application_id = db.Column(db.Integer, db.ForeignKey("application.id"), nullable=False, index=True)
+    sender_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    sender_role = db.Column(db.String(20))
+    sender_name = db.Column(db.String(150))
+    body = db.Column(db.String(1000), nullable=False)
+    created_at = db.Column(db.DateTime, default=now)
+
+    def to_dict(self, viewer_id=None):
+        return {"id": self.id, "body": self.body, "sender_name": self.sender_name,
+                "sender_role": self.sender_role, "mine": self.sender_id == viewer_id,
+                "created_at": self.created_at.isoformat()}

@@ -20,7 +20,8 @@ def _send_otp(u, purpose="verify"):
     u.otp_code, u.otp_expires, u.otp_attempts = gen_otp(), now() + timedelta(minutes=10), 0
     u.otp_purpose = purpose
     text = {"verify": "Your eLiberia code is {c}",
-            "reset": "{c} is your eLiberia password reset code. Never share it with anyone."}[purpose]
+            "reset": "{c} is your eLiberia password reset code. Never share it with anyone.",
+            "login": "{c} is your eLiberia staff sign-in code. Never share it with anyone."}[purpose]
     notify(u.id, "eLiberia code", text.format(c=u.otp_code), channel="sms")
 
 
@@ -119,6 +120,14 @@ def login():
     if not u.phone_verified:
         return err("Phone number not verified", 403)
     u.failed_logins, u.locked_until = 0, None
+    if u.role != "citizen" and current_app.config["STAFF_2FA"]:
+        _send_otp(u, "login")
+        audit("login_password_ok", u.phone, user_id=u.id)
+        db.session.commit()
+        out = {"two_factor": True, "message": "Enter the sign-in code sent to your phone."}
+        if current_app.config["EXPOSE_OTP"]:
+            out["dev_otp"] = u.otp_code
+        return jsonify(out)
     audit("login", u.phone, user_id=u.id)
     db.session.commit()
     return jsonify({"token": make_token(u), "user": u.to_dict()})
@@ -218,5 +227,20 @@ def reset():
     u.token_version = (u.token_version or 0) + 1
     notify(u.id, "Password reset", "Your password was reset. All devices were signed out.")
     audit("password_reset", u.phone, user_id=u.id)
+    db.session.commit()
+    return jsonify({"token": make_token(u), "user": u.to_dict()})
+
+
+@bp.post("/login/verify")
+@rate_limit("login_verify", 20, 600)
+def login_verify():
+    """Second step of staff / agent sign-in."""
+    d = request.get_json(silent=True) or {}
+    u = User.query.filter_by(phone=normalize_phone(d.get("phone")) or "").first()
+    bad = _check_otp(u, d.get("otp"), "login")
+    if bad:
+        return bad
+    u.otp_code, u.otp_attempts = None, 0
+    audit("login", u.phone, user_id=u.id)
     db.session.commit()
     return jsonify({"token": make_token(u), "user": u.to_dict()})

@@ -93,6 +93,94 @@ SERVICES = [
 ]
 
 
+INSTITUTIONS += [
+    ("LIS", "Liberia Immigration Service", "Residence permits and border services"),
+    ("MOL", "Ministry of Labour", "Work permits and labour compliance"),
+    ("MOE", "Ministry of Education", "Academic credentials"),
+    ("NASSCORP", "National Social Security and Welfare Corporation", "Social security registration"),
+    ("MIA", "Ministry of Internal Affairs", "Marriage certificates and local governance"),
+    ("MOCI", "Ministry of Commerce and Industry", "Import permits and trade"),
+    ("MPW", "Ministry of Public Works", "Construction permits"),
+    ("EPA", "Environmental Protection Agency", "Environmental permits"),
+    ("LWSC", "Liberia Water and Sewer Corporation", "Water connections"),
+]
+
+SERVICES += [
+    ("DEATH_CERT", "Death Certificate", "Civil", "MOH", 3.0, 7, False, False,
+     ["Medical or burial notification", "Informant's ID"],
+     [F("deceased_name", "Full name of the deceased"), F("date_of_death", "Date of death", "date"),
+      F("place_of_death", "Place of death"), F("informant_relation", "Your relationship to the deceased")],
+     "Register a death and receive the certificate."),
+    ("BIRTH_CERT_REPLACE", "Birth Certificate - Replacement", "Civil", "MOH", 3.0, 5, False, False,
+     ["Any ID or affidavit"], [F("full_name", "Full name on certificate"), F("dob", "Date of birth", "date"),
+                               F("mother_name", "Mother's name")],
+     "Replace a lost or damaged birth certificate."),
+    ("MARRIAGE_CERT", "Marriage Certificate", "Civil", "MIA", 20.0, 7, True, False,
+     ["ID of both spouses", "Proof of ceremony or affidavit"],
+     [F("spouse_one", "Full name of first spouse"), F("spouse_two", "Full name of second spouse"),
+      F("marriage_date", "Date of marriage", "date"), F("marriage_type", "Type", "select",
+                                                        options=["Civil", "Traditional", "Religious"])],
+     "Register a marriage and receive the certificate."),
+    ("RESIDENT_PERMIT", "Resident Permit", "Immigration", "LIS", 75.0, 14, True, True,
+     ["Passport bio page", "Proof of address", "Passport-size photo"],
+     [F("full_name", "Full name"), F("nationality", "Nationality"), F("passport_no", "Passport number"),
+      F("purpose", "Purpose of stay", "select", options=["Work", "Family", "Study", "Investment"])],
+     "Apply for or renew a resident permit."),
+    ("WORK_PERMIT", "Work Permit", "Labour", "MOL", 100.0, 14, True, False,
+     ["Employment contract", "Passport bio page", "Employer's business registration"],
+     [F("full_name", "Employee full name"), F("employer", "Employer"), F("position", "Position"),
+      F("nationality", "Nationality")], "Work permit for a foreign national."),
+    ("NASSCORP_REG", "Social Security Registration", "Social Security", "NASSCORP", 0.0, 5, False, False,
+     ["National ID"], [F("full_name", "Full name"), F("nin", "National ID number"),
+                       F("employer", "Employer", required=False)],
+     "Register for a social security number."),
+    ("BUSINESS_RENEW", "Business Registration - Annual Renewal", "Business", "LBR", 50.0, 3, False, False,
+     ["Current registration certificate", "Tax clearance"],
+     [F("business_name", "Business name"), F("reg_no", "Registration number")],
+     "Renew your business registration for another year."),
+    ("IMPORT_PERMIT", "Import Permit Declaration", "Business", "MOCI", 30.0, 7, False, False,
+     ["Business registration", "Pro-forma invoice"],
+     [F("business_name", "Business name"), F("goods", "Goods to import"), F("origin", "Country of origin"),
+      F("value_usd", "Declared value (USD)", "number")], "Permit to import goods."),
+    ("CONSTRUCTION_PERMIT", "Construction Permit", "Land", "MPW", 60.0, 21, False, False,
+     ["Land deed", "Architectural drawings"],
+     [F("site_address", "Site address"), F("building_use", "Use", "select",
+                                           options=["Residential", "Commercial", "Mixed"]),
+      F("floors", "Number of floors", "number")], "Permit to build or extend a structure."),
+    ("LAND_DEED_REG", "Land Deed Registration", "Land", "LLA", 50.0, 21, True, False,
+     ["Deed or sale agreement", "Survey plan", "National ID"],
+     [F("county", "County"), F("district", "District"), F("area", "Area (acres or lots)"),
+      F("acquired_from", "Acquired from")], "Register a deed with the Land Authority."),
+    ("EPA_PERMIT", "Environmental Permit", "Environment", "EPA", 100.0, 30, False, False,
+     ["Project brief", "Site map"], [F("project_name", "Project name"), F("location", "Location"),
+                                     F("sector", "Sector", "select",
+                                       options=["Mining", "Agriculture", "Construction", "Energy", "Other"])],
+     "Environmental permit for a project."),
+    ("WATER_CONNECT", "Water Connection", "Utilities", "LWSC", 35.0, 14, False, False,
+     ["National ID", "Proof of address"], [F("address", "Service address"),
+                                           F("property_type", "Property", "select",
+                                             options=["Residential", "Commercial"])],
+     "Request a new water connection."),
+    ("CREDENTIAL_VERIFY", "Academic Credential Verification", "Education", "MOE", 10.0, 7, False, False,
+     ["Certificate or diploma", "Transcript"],
+     [F("full_name", "Name on the credential"), F("school", "School or institution"),
+      F("year", "Year completed", "number")], "Official verification of a school or university credential."),
+    ("DRIVER_LICENSE_REPLACE", "Driver's License - Replacement", "Transport", "MOT", 15.0, 5, True, False,
+     ["Police report if lost"], [F("license_no", "License number", required=False), F("full_name", "Full name"),
+                                 F("reason", "Reason", "select", options=["Lost", "Damaged", "Stolen"])],
+     "Replace a lost, stolen or damaged license."),
+    ("VEHICLE_REG_RENEW", "Vehicle Registration - Renewal", "Transport", "MOT", 20.0, 3, False, False,
+     ["Current registration", "Insurance certificate"], [F("plate_no", "Plate number")],
+     "Renew your vehicle registration."),
+    ("TAX_RETURN", "Personal Income Tax Return", "Tax", "LRA", 0.0, 3, False, False,
+     ["Income statement"], [F("tin", "TIN"), F("tax_year", "Tax year", "number"),
+                            F("income_usd", "Total income (USD)", "number")], "File your annual income tax return."),
+    ("LOST_DOC_REPORT", "Lost Document Police Report", "Legal", "LNP", 0.0, 2, False, False,
+     ["Any ID"], [F("document_type", "Document lost"), F("date_lost", "Date lost", "date"),
+                  F("place_lost", "Where it was lost")], "Police report needed to replace a lost document."),
+]
+
+
 def seed(reset_demo=True):
     insts = {}
     for code, name, desc in INSTITUTIONS:
@@ -101,7 +189,9 @@ def seed(reset_demo=True):
         insts[code] = i
     db.session.flush()
     for code, name, cat, inst, fee, sla, face, finger, docs, fields, desc in SERVICES:
-        s = Service.query.filter_by(code=code).first() or Service(code=code)
+        if Service.query.filter_by(code=code).first():
+            continue  # keep whatever an administrator has changed
+        s = Service(code=code)
         s.name, s.category, s.institution_id, s.fee_usd, s.sla_days = name, cat, insts[inst].id, fee, sla
         s.requires_face, s.requires_fingerprint, s.required_documents = face, finger, docs
         s.form_fields, s.description = fields, desc

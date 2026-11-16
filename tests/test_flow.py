@@ -17,7 +17,10 @@ def hdr(tok):
 
 
 def login(c, phone, pw):
-    return c.post("/api/auth/login", json={"phone": phone, "password": pw}).get_json()["token"]
+    r = c.post("/api/auth/login", json={"phone": phone, "password": pw}).get_json()
+    if r.get("two_factor"):  # staff and agents confirm with a one-time code
+        r = c.post("/api/auth/login/verify", json={"phone": phone, "otp": r["dev_otp"]}).get_json()
+    return r["token"]
 
 
 def register(c, phone="0770111222"):
@@ -226,3 +229,74 @@ def test_agent_assisted_flow_and_password_reset(client):
     assert len(mine) == 1 and mine[0]["id"] == aid
     assert client.post(f"/api/applications/{aid}/pay", headers=hdr(r.get_json()["token"]),
                        json={"method": "agent_cash"}).status_code in (400, 409)
+
+
+def test_messages_wallet_revocation_and_two_step_login(client):
+    # staff password alone is not enough; a wrong code is refused
+    r = client.post("/api/auth/login", json={"phone": "0770000001", "password": "Admin@12345"}).get_json()
+    assert r.get("two_factor") and "token" not in r
+    assert client.post("/api/auth/login/verify", json={"phone": "0770000001", "otp": "000000"}).status_code == 400
+    tok, other = register(client, "0770999001"), register(client, "0770999002")
+    a = _approved_app(client, tok)
+    adm = login(client, "+231770000001", "Admin@12345")
+    # conversation
+    assert client.post(f"/api/applications/{a['id']}/messages", headers=hdr(tok), json={"body": "x"}).status_code == 400
+    assert client.post(f"/api/applications/{a['id']}/messages", headers=hdr(tok),
+                       json={"body": "When can I collect it?"}).status_code == 201
+    assert client.post(f"/api/applications/{a['id']}/messages", headers=hdr(adm),
+                       json={"body": "It is ready on Monday."}).status_code == 201
+    msgs = client.get(f"/api/applications/{a['id']}/messages", headers=hdr(tok)).get_json()
+    assert [m["mine"] for m in msgs] == [True, False]
+    assert client.get(f"/api/applications/{a['id']}/messages", headers=hdr(other)).status_code == 404
+    assert client.get("/api/notifications/count", headers=hdr(tok)).get_json()["unread"] >= 1
+    # wallet and revocation
+    wallet = client.get("/api/certificates", headers=hdr(tok)).get_json()
+    assert len(wallet) == 1 and client.get("/api/certificates", headers=hdr(other)).get_json() == []
+    num = wallet[0]["number"]
+    assert client.post(f"/api/staff/certificates/{num}/revoke", headers=hdr(tok), json={"reason": "nope nope"}).status_code == 403
+    assert client.post(f"/api/staff/certificates/{num}/revoke", headers=hdr(adm), json={"reason": "Issued in error"}).status_code == 200
+    v = client.get(f"/api/verify/{num}").get_json()
+    assert v["valid"] is False and "revoked" in v["reason"]
+
+
+def test_admin_service_management_and_catalog_size(client):
+    assert len(client.get("/api/services").get_json()) >= 30
+    adm = login(client, "+231770000001", "Admin@12345")
+    inst = client.get("/api/institutions").get_json()[0]["id"]
+    body = {"code": "fishing license", "name": "Fishing License", "category": "Business", "institution_id": inst,
+            "fee_usd": 12.5, "sla_days": 4, "required_documents": ["National ID"],
+            "form_fields": [{"label": "Boat name", "type": "text"},
+                            {"label": "Zone", "type": "select", "options": ["Coastal", "Inland"]}]}
+    r = client.post("/api/admin/services", headers=hdr(adm), json=body)
+    assert r.status_code == 201 and r.get_json()["code"] == "FISHING_LICENSE"
+    assert r.get_json()["form_fields"][0]["name"] == "boat_name"
+    assert client.post("/api/admin/services", headers=hdr(adm), json=body).status_code == 409
+    assert client.get("/api/services/FISHING_LICENSE").status_code == 200
+    bad = {**body, "form_fields": [{"label": "Zone", "type": "select", "options": ["Only one"]}]}
+    assert client.put("/api/admin/services/FISHING_LICENSE", headers=hdr(adm), json=bad).status_code == 400
+    assert client.put("/api/admin/services/FISHING_LICENSE", headers=hdr(adm),
+                      json={"fee_usd": 20, "active": False}).get_json()["fee_usd"] == 20
+    assert client.get("/api/services/FISHING_LICENSE").status_code == 404  # hidden from citizens
+    tok = register(client, "0770999003")
+    assert client.post("/api/admin/services", headers=hdr(tok), json=body).status_code == 403
+
+
+def test_ussd_channel(client):
+    def dial(text, phone="+231770999004", key=None):
+        url = "/api/ussd" + (f"?key={key}" if key else "")
+        return client.post(url, data={"sessionId": "s1", "phoneNumber": phone, "text": text}).get_data(as_text=True)
+    assert dial("").startswith("CON Welcome to eLiberia")
+    tok = register(client, "0770999004")
+    a = client.post("/api/applications", headers=hdr(tok), json={"service_code": "PASSPORT_NEW"}).get_json()
+    assert dial("1").startswith("CON")
+    out = dial(f"1*{a['bill_id']}")
+    assert out.startswith("END Passport") and "Unpaid: $50.00" in out
+    assert "Status" in dial("1*" + a["reference"].replace("-", "").lower())
+    assert dial("1*999").startswith("END No application")
+    assert "$50.00" in dial("3*passport")
+    assert dial("4*ELC2026DEADBEEF").startswith("END NOT VERIFIED")
+    # the caller's own list is only shown when the gateway proves itself
+    assert "only works" in dial("2")
+    client.application.config["USSD_SECRET"] = "gw-secret"
+    assert "Passport" in dial("2", key="gw-secret")
+    assert "only works" in dial("2", key="wrong")

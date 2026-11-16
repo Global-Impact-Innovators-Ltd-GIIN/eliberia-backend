@@ -26,5 +26,9 @@ class Config:
     TOKEN_HOURS = int(os.getenv("TOKEN_HOURS", "12"))
     # When True, OTP codes are returned in API responses (development only!)
     EXPOSE_OTP = os.getenv("EXPOSE_OTP", "True").lower() == "true"
+    # staff, admins and agents confirm sign-in with a one-time code
+    STAFF_2FA = os.getenv("STAFF_2FA", "True").lower() == "true"
+    # shared secret the USSD gateway appends as ?key=...; without it the caller's number is not trusted
+    USSD_SECRET = os.getenv("USSD_SECRET") or None
     PAYMENT_PROVIDER = os.getenv("PAYMENT_PROVIDER", "mock")
     BIOMETRIC_PROVIDER = os.getenv("BIOMETRIC_PROVIDER", "mock")
