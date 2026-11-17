@@ -4,7 +4,8 @@ SMS_PROVIDER:
   log            (default) messages are only written to the server log - nothing leaves the server
   africastalking Africa's Talking  - SMS_USERNAME, SMS_API_KEY, optional SMS_SENDER_ID
                  (SMS_USERNAME=sandbox uses their free sandbox)
-  twilio         Twilio            - SMS_ACCOUNT_SID, SMS_AUTH_TOKEN, SMS_FROM
+  twilio         Twilio            - SMS_ACCOUNT_SID, SMS_AUTH_TOKEN, SMS_FROM (a phone number, an
+                 alphanumeric sender ID, or a Messaging Service SID starting with MG)
 
 Messages are queued during a request and only sent once the response succeeded, so a request that fails
 and rolls back never texts anybody.
@@ -52,9 +53,13 @@ def send(phone, text):
             sid = cfg["SMS_ACCOUNT_SID"]
             url = f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json"
             auth = base64.b64encode(f"{sid}:{cfg['SMS_AUTH_TOKEN']}".encode()).decode()
-            req = urllib.request.Request(url, data=urllib.parse.urlencode(
-                {"To": phone, "From": cfg["SMS_FROM"], "Body": text}).encode(),
-                headers={"Authorization": f"Basic {auth}"})
+            sender = cfg["SMS_FROM"]
+            # A Messaging Service SID (MG...) carries a registered alphanumeric sender ID, which Liberia's MTN
+            # network requires; otherwise SMS_FROM is a phone number or an alphanumeric ID such as "eLiberia".
+            form = {"To": phone, "Body": text,
+                    ("MessagingServiceSid" if sender.startswith("MG") and len(sender) == 34 else "From"): sender}
+            req = urllib.request.Request(url, data=urllib.parse.urlencode(form).encode(),
+                                         headers={"Authorization": f"Basic {auth}"})
         else:
             current_app.logger.info("SMS (not sent, SMS_PROVIDER=log) to %s***: %d chars", phone[:7], len(text))
             return True
